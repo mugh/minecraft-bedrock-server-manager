@@ -1,6 +1,6 @@
 ## Minecraft Bedrock Server Manager
 
-Full-stack application to manage multiple Minecraft Bedrock servers using Docker.
+Full-stack application to manage multiple Minecraft Bedrock servers using itzg/docker-minecraft-bedrock-server.
 
 ### Features
 - ✅ Multiple server management
@@ -190,3 +190,4 @@ The application includes password protection:
 - Session-based authentication
 - Mobile responsive design for all devices
 - Real-time updates without page refresh
+
