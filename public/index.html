@@ -85,7 +85,7 @@
 </head>
 <body>
     <!-- Login Form -->
-    <div id="loginForm" class="flex items-center justify-center min-h-screen bg-gray-900 px-4">
+    <div id="loginForm" class="hidden flex items-center justify-center min-h-screen bg-gray-900 px-4">
         <div class="bg-gray-800 p-6 rounded-lg shadow-lg w-full max-w-sm">
             <h1 class="text-lg md:text-xl font-bold mb-4 text-center">🔒 Server Manager Login</h1>
             <div class="mb-3">
@@ -98,7 +98,7 @@
         </div>
     </div>
 
-    <div id="app" class="hidden"></div>
+    <div id="app"></div>
     
     <!-- Upload Modal -->
     <div id="uploadModal" class="modal">
@@ -229,7 +229,25 @@
         
         // Check if user is logged in
         function checkAuth() {
-            return localStorage.getItem('isAuthenticated') === 'true';
+            const isAuthenticated = localStorage.getItem('isAuthenticated') === 'true';
+            const loginTimestamp = localStorage.getItem('loginTimestamp');
+
+            if (!isAuthenticated || !loginTimestamp) {
+                return false;
+            }
+
+            // Check if session is still valid (24 hours)
+            const sessionDuration = Date.now() - parseInt(loginTimestamp, 10);
+            const maxSessionTime = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+
+            if (sessionDuration > maxSessionTime) {
+                // Session expired, clear authentication
+                localStorage.removeItem('isAuthenticated');
+                localStorage.removeItem('loginTimestamp');
+                return false;
+            }
+
+            return true;
         }
         
         // Check if login is locked out
@@ -282,20 +300,21 @@
             const passwordInput = document.getElementById('passwordInput');
             const errorElement = document.getElementById('loginError');
             const loginButton = document.getElementById('loginButton');
-            
+
             if (isLoginLocked()) {
                 const remainingTime = getRemainingLockoutTime();
                 errorElement.textContent = `Too many failed attempts. Please wait ${remainingTime} seconds.`;
                 errorElement.classList.remove('hidden');
                 return;
             }
-            
+
             if (passwordInput.value === LOGIN_CONFIG.PASSWORD) {
                 // Login successful
                 localStorage.setItem('isAuthenticated', 'true');
+                localStorage.setItem('loginTimestamp', Date.now()); // Store login time
                 localStorage.removeItem('loginAttempts');
                 localStorage.removeItem('lastFailedAttempt');
-                
+
                 document.getElementById('loginForm').classList.add('hidden');
                 document.getElementById('app').classList.remove('hidden');
                 fetchServers();
@@ -304,11 +323,11 @@
                 const attempts = parseInt(localStorage.getItem('loginAttempts') || '0') + 1;
                 localStorage.setItem('loginAttempts', attempts);
                 localStorage.setItem('lastFailedAttempt', Date.now());
-                
+
                 const remainingAttempts = LOGIN_CONFIG.MAX_ATTEMPTS - attempts;
                 errorElement.textContent = `Incorrect password. ${remainingAttempts} attempts remaining.`;
                 errorElement.classList.remove('hidden');
-                
+
                 if (attempts >= LOGIN_CONFIG.MAX_ATTEMPTS) {
                     updateLoginButtonState();
                 }
@@ -364,19 +383,32 @@
             updateInterval: 5000, // 5 seconds
             addons: { behaviorPacks: [], resourcePacks: [] },
             worlds: [],
-            forceFullRender: false
+            forceFullRender: false,
+            lastActionServer: null
         };
 
         // Fetch functions
         async function fetchServers() {
             try {
                 const res = await fetch(`${API_BASE}/servers`);
-                state.servers = await res.json();
+                const newServers = await res.json();
+
+                // Check if the selected server status changed
+                const selectedServer = state.servers.find(s => s.id === state.selectedServer);
+                const newSelectedServer = newServers.find(s => s.id === state.selectedServer);
+
+                state.servers = newServers;
                 if (!state.selectedServer && state.servers.length > 0) {
                     state.selectedServer = state.servers[0].id;
                 }
+
                 renderSidebar();
                 render();
+
+                // If selected server status changed, fetch its details
+                if (selectedServer && newSelectedServer && selectedServer.status !== newSelectedServer.status) {
+                    fetchServerDetails();
+                }
             } catch (err) {
                 console.error('Failed to fetch servers:', err);
             }
@@ -552,11 +584,42 @@
                         confirmButtonText: 'Yes, delete it!'
                     });
                     if (!result.isConfirmed) return;
+                } else if (action === 'start' || action === 'stop' || action === 'restart') {
+                    const server = state.servers.find(s => s.id === state.selectedServer);
+                    const serverName = server ? server.name : 'this server';
+                    let confirmColor = '#10b981';
+                    let confirmText = `Yes, ${action} it!`;
+                    if (action === 'stop') {
+                        confirmColor = '#dc2626';
+                    } else if (action === 'restart') {
+                        confirmColor = '#f59e0b';
+                    }
+                    const result = await Swal.fire({
+                        title: `${action.charAt(0).toUpperCase() + action.slice(1)} Server`,
+                        text: `Are you sure you want to ${action} "${serverName}"?`,
+                        icon: 'question',
+                        showCancelButton: true,
+                        confirmButtonColor: confirmColor,
+                        cancelButtonColor: '#6b7280',
+                        confirmButtonText: confirmText
+                    });
+                    if (!result.isConfirmed) return;
                 }
                 showLoading();
-                await fetch(`${API_BASE}/servers/${state.selectedServer}/${action}`, { method: 'POST' });
-                await fetchServers();
-                hideLoading();
+
+                const response = await fetch(`${API_BASE}/servers/${state.selectedServer}/${action}`, { method: 'POST' });
+                if (response.ok) {
+                    // Force a full page reload to ensure all UI updates correctly
+                    window.location.reload();
+                } else {
+                    hideLoading();
+                    Swal.fire({
+                        title: 'Error',
+                        text: `Failed to ${action} server`,
+                        icon: 'error',
+                        confirmButtonColor: '#10b981'
+                    });
+                }
             } catch (err) {
                 hideLoading();
                 console.error(`Failed to ${action}:`, err);
@@ -1630,7 +1693,7 @@
                                 <div class="flex items-center justify-between">
                                     <div>
                                         <div class="font-medium truncate">${server.name}</div>
-                                        <div class="text-xs text-white-400">Port: ${server.ports?.find(p => p.PrivatePort === 19132)?.PublicPort || '19132'}</div>
+                                        ${server.status === 'running' ? `<div class="text-xs text-white-400">Port: ${server.ports?.find(p => p.PrivatePort === 19132)?.PublicPort || '19132'}</div>` : ''}
                                     </div>
                                     <span class="status-dot ${server.status === 'running' ? 'bg-green-500' : 'bg-red-500'}"></span>
                                 </div>
@@ -1669,7 +1732,10 @@
                             <button onclick="toggleSidebar()" class="mobile-menu-btn px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded-lg">
                                 ☰
                             </button>
-                            <h1 class="text-lg md:text-xl font-bold">🎮 Bedrock Server Manager</h1>
+                            <div class="flex flex-col">
+                                <h1 class="text-lg md:text-xl font-bold">🎮 Bedrock Server Manager</h1>
+                                <div class="text-xs text-gray-500">By mughniy - for all father who loves their kids</div>
+                            </div>
                         </div>
                         <button onclick="createServer()" class="px-2 md:px-3 py-1.5 text-xs md:text-sm bg-green-600 hover:bg-green-700 rounded-lg">
                             <span class="hidden sm:inline">+ New Server</span>
@@ -1698,7 +1764,7 @@
                                     <div class="flex items-center justify-between">
                                         <div>
                                             <div class="font-medium truncate">${server.name}</div>
-                                            <div class="text-xs text-white-400">Port: ${server.ports?.find(p => p.PrivatePort === 19132)?.PublicPort || '19132'}</div>
+                                            ${server.status === 'running' ? `<div class="text-xs text-white-400">Port: ${server.ports?.find(p => p.PrivatePort === 19132)?.PublicPort || '19132'}</div>` : ''}
                                         </div>
                                         <span class="status-dot ${server.status === 'running' ? 'bg-green-500' : 'bg-red-500'}"></span>
                                     </div>
@@ -2190,10 +2256,12 @@
         }
 
         function selectServer(id) {
+            // If switching to a different server, reset to dashboard tab
+            if (state.selectedServer !== id) {
+                state.activeTab = 'dashboard';
+                state.forceFullRender = true; // Force full render when switching servers
+            }
             state.selectedServer = id;
-            // Reset to dashboard tab when switching servers
-            state.activeTab = 'dashboard';
-            state.forceFullRender = true; // Force full render when switching servers
             renderSidebar();
             render(); // Update main content immediately with new server info
             fetchServerDetails();
