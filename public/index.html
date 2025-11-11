@@ -1621,7 +1621,7 @@
                         ${state.servers.map(server => `
                             <button
                                 onclick="selectServer('${server.id}')"
-                                oncontextmenu="showServerContextMenu(event, '${server.id}')"
+                                oncontextmenu="showServerContextMenu(event, '${server.id}'); return false;"
                                 class="w-full text-left p-2 rounded-lg mb-1.5 transition text-sm ${
                                     state.selectedServer === server.id
                                         ? 'bg-green-600 text-white'
@@ -1689,6 +1689,7 @@
                             ${state.servers.map(server => `
                                 <button
                                     onclick="selectServer('${server.id}')"
+                                    oncontextmenu="showServerContextMenu(event, '${server.id}'); return false;"
                                     class="w-full text-left p-2 rounded-lg mb-1.5 transition text-sm ${
                                         state.selectedServer === server.id
                                             ? 'bg-green-600 text-white'
