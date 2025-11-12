@@ -11,7 +11,6 @@ The aplication will deploy a minecraft bedrock server using docker itzg/docker-m
 - ✅ Multiple server management
 - ✅ Start/Stop/Restart containers
 - ✅ Server renaming
-- ✅ Real-time logs & monitoring
 - ✅ Console commands
 - ✅ **Advanced File Manager**
   - Upload multiple files
@@ -257,3 +256,4 @@ The application includes password protection:
 ![enter image description here](https://github.com/mugh/minecraftbedrockservermanager/blob/main/Screenshot/Screenshot%202025-11-12%20101458.png?raw=true)
 ![enter image description here](https://github.com/mugh/minecraftbedrockservermanager/blob/main/Screenshot/Screenshot%202025-11-12%20101519.png?raw=true)
 ![enter image description here](https://github.com/mugh/minecraftbedrockservermanager/blob/main/Screenshot/Screenshot%202025-11-12%20101527.png?raw=true)
+
