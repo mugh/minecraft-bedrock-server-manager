@@ -302,7 +302,7 @@
             if (isLoginLocked()) {
                 const remainingTime = getRemainingLockoutTime();
                 loginButton.disabled = true;
-                loginButton.textContent = `Tunggu ${remainingTime} detik`;
+                loginButton.textContent = `Wait ${remainingTime} seconds`;
 
                 if (remainingTime > 0) {
                     setTimeout(updateLoginButtonState, 1000);
@@ -312,7 +312,7 @@
                     localStorage.removeItem('lastFailedAttempt');
                     loginButton.disabled = false;
                     loginButton.textContent = 'Login';
-                    errorElement.textContent = 'Silakan coba login kembali';
+                    errorElement.textContent = 'Please try logging in again.';
                     errorElement.classList.remove('hidden');
                     setTimeout(() => errorElement.classList.add('hidden'), 3000);
                 }
