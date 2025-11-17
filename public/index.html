@@ -1125,6 +1125,163 @@
             }
         }
 
+        async function editServerMemory() {
+            const currentServer = state.servers.find(s => s.id === state.selectedServer);
+            if (!currentServer) return;
+
+            // Parse current memory from formatted string (e.g., "2 GB" or "2048 MB")
+            let currentMemoryMB = 2048; // default fallback
+            let isCustomMemory = false;
+            if (currentServer.memory) {
+                const memoryStr = currentServer.memory.toString();
+                const match = memoryStr.match(/(\d+(?:\.\d+)?)\s*(GB|MB|KB|B)/i);
+                if (match) {
+                    const value = parseFloat(match[1]);
+                    const unit = match[2].toUpperCase();
+                    switch (unit) {
+                        case 'GB':
+                            currentMemoryMB = Math.round(value * 1024);
+                            break;
+                        case 'MB':
+                            currentMemoryMB = Math.round(value);
+                            break;
+                        case 'KB':
+                            currentMemoryMB = Math.round(value / 1024);
+                            break;
+                        case 'B':
+                            currentMemoryMB = Math.round(value / (1024 * 1024));
+                            break;
+                    }
+                }
+            }
+
+            // Check if current memory matches any preset
+            const presets = [1024, 2048, 4096, 8192, 16384];
+            if (!presets.includes(currentMemoryMB)) {
+                isCustomMemory = true;
+            }
+
+            const { value: memory } = await Swal.fire({
+                title: 'Edit Server Memory',
+                html: `
+                    <div class="text-left">
+                        <div class="mb-4">
+                            <label class="block text-sm font-medium text-gray-300 mb-2">Current Memory: <span class="text-green-400">${currentMemoryMB} MB</span></label>
+                            <div class="space-y-2">
+                                <div class="flex gap-2">
+                                    <label class="flex items-center">
+                                        <input type="radio" name="memory-preset" value="1024" ${currentMemoryMB === 1024 ? 'checked' : ''} class="mr-2">
+                                        <span class="text-sm">1 GB (1024 MB)</span>
+                                    </label>
+                                </div>
+                                <div class="flex gap-2">
+                                    <label class="flex items-center">
+                                        <input type="radio" name="memory-preset" value="2048" ${currentMemoryMB === 2048 ? 'checked' : ''} class="mr-2">
+                                        <span class="text-sm">2 GB (2048 MB)</span>
+                                    </label>
+                                </div>
+                                <div class="flex gap-2">
+                                    <label class="flex items-center">
+                                        <input type="radio" name="memory-preset" value="4096" ${currentMemoryMB === 4096 ? 'checked' : ''} class="mr-2">
+                                        <span class="text-sm">4 GB (4096 MB)</span>
+                                    </label>
+                                </div>
+                                <div class="flex gap-2">
+                                    <label class="flex items-center">
+                                        <input type="radio" name="memory-preset" value="8192" ${currentMemoryMB === 8192 ? 'checked' : ''} class="mr-2">
+                                        <span class="text-sm">8 GB (8192 MB)</span>
+                                    </label>
+                                </div>
+                                <div class="flex gap-2">
+                                    <label class="flex items-center">
+                                        <input type="radio" name="memory-preset" value="16384" ${currentMemoryMB === 16384 ? 'checked' : ''} class="mr-2">
+                                        <span class="text-sm">16 GB (16384 MB)</span>
+                                    </label>
+                                </div>
+                                <div class="flex gap-2">
+                                    <label class="flex items-center">
+                                        <input type="radio" name="memory-preset" value="custom" ${isCustomMemory ? 'checked' : ''} class="mr-2">
+                                        <span class="text-sm">Custom:</span>
+                                    </label>
+                                    <input id="swal-custom-memory" type="number" min="256" max="32768" value="${isCustomMemory ? currentMemoryMB : ''}" placeholder="e.g. 3072" class="flex-1 px-3 py-1 bg-gray-700 border border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500 text-white text-sm" ${isCustomMemory ? '' : 'disabled'}>
+                                </div>
+                            </div>
+                            <div class="text-xs text-yellow-400 mt-2">
+                                ⚠️ Changing memory will restart the server. Ensure your system has enough RAM available.
+                            </div>
+                        </div>
+                    </div>
+                `,
+                showCancelButton: true,
+                confirmButtonColor: '#9333ea',
+                cancelButtonColor: '#6b7280',
+                confirmButtonText: 'Update Memory',
+                didOpen: () => {
+                    // Enable/disable custom memory input based on radio selection
+                    document.querySelectorAll('input[name="memory-preset"]').forEach(radio => {
+                        radio.addEventListener('change', (e) => {
+                            const customInput = document.getElementById('swal-custom-memory');
+                            customInput.disabled = e.target.value !== 'custom';
+                            if (e.target.value === 'custom') {
+                                customInput.focus();
+                            }
+                        });
+                    });
+                },
+                preConfirm: () => {
+                    const presetValue = document.querySelector('input[name="memory-preset"]:checked').value;
+                    let memory;
+
+                    if (presetValue === 'custom') {
+                        memory = parseInt(document.getElementById('swal-custom-memory').value.trim());
+                        if (!memory || memory < 256 || memory > 32768) {
+                            Swal.showValidationMessage('Memory must be between 256 MB and 32768 MB!');
+                            return false;
+                        }
+                    } else {
+                        memory = parseInt(presetValue);
+                    }
+
+                    return memory;
+                }
+            });
+
+            if (!memory) return;
+
+            try {
+                showLoading();
+                const response = await fetch(`${API_BASE}/servers/${state.selectedServer}/memory`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ memory })
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    await fetchServers();
+                    hideLoading();
+                    Swal.fire({
+                        title: 'Success',
+                        html: `✅ Server memory updated to ${memory} MB!<br><br>${result.restarted ? 'Server has been restarted.' : 'Server was stopped and will need to be started manually.'}`,
+                        icon: 'success',
+                        confirmButtonColor: '#10b981'
+                    });
+                } else {
+                    hideLoading();
+                    throw new Error(result.error || 'Failed to update memory');
+                }
+            } catch (err) {
+                hideLoading();
+                Swal.fire({
+                    title: 'Error',
+                    text: 'Failed to update server memory: ' + err.message,
+                    icon: 'error',
+                    confirmButtonColor: '#10b981'
+                });
+            }
+        }
+
         async function executeCommand() {
             if (!state.consoleCommand.trim()) return;
             try {
@@ -2202,6 +2359,7 @@
                                             <h2 class="text-base md:text-lg font-bold truncate">${currentServer.name}</h2>
                                             <span class="px-2 py-0.5 text-xs bg-blue-600 rounded-lg">v${currentServer.version || 'LATEST'}</span>
                                             <button onclick="editServerVersion()" class="px-2 py-0.5 text-xs bg-gray-600 hover:bg-gray-500 rounded" title="Edit Version">✏️</button>
+                                            <button onclick="editServerMemory()" class="px-2 py-0.5 text-xs bg-purple-600 hover:bg-purple-500 rounded" title="Edit Memory">🧠</button>
                                         </div>
                                         <div class="text-xs text-gray-400 mt-0.5 truncate">
                                             ${currentServer.status} • ${currentServer.worldSize}

@@ -220,6 +220,7 @@ app.post('/api/servers', async (req, res) => {
     const metadata = {
       name: name,
       version: version,
+      memory: 2 * 1024 * 1024 * 1024, // 2GB default
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     };
@@ -249,7 +250,7 @@ app.post('/api/servers', async (req, res) => {
         RestartPolicy: {
           Name: 'unless-stopped'
         },
-        Memory: 2 * 1024 * 1024 * 1024 // 2GB
+        Memory: metadata.memory
       }
     });
 
@@ -325,6 +326,9 @@ app.post('/api/servers/:id/start', async (req, res) => {
           metadata = await fs.readJson(metadataPath);
         }
 
+        // Get memory from metadata
+        let memory = metadata.memory || 2 * 1024 * 1024 * 1024; // default 2GB
+
         const newContainer = await docker.createContainer({
           Image: BEDROCK_IMAGE,
           name: serverId,
@@ -345,7 +349,7 @@ app.post('/api/servers/:id/start', async (req, res) => {
             RestartPolicy: {
               Name: 'unless-stopped'
             },
-            Memory: containerInfo.HostConfig.Memory || 2 * 1024 * 1024 * 1024 // 2GB
+            Memory: memory
           }
         });
 
@@ -462,6 +466,9 @@ app.post('/api/servers/:id/rename', async (req, res) => {
     // Find available port (reuse existing if possible)
     const gamePort = containerInfo.HostConfig.PortBindings['19132/udp']?.[0]?.HostPort || await findAvailablePort(19132);
 
+    // Get memory from metadata
+    let memory = metadata.memory || 2 * 1024 * 1024 * 1024; // default 2GB
+
     // Create new container with updated server name
     const newContainer = await docker.createContainer({
       Image: BEDROCK_IMAGE,
@@ -483,7 +490,7 @@ app.post('/api/servers/:id/rename', async (req, res) => {
         RestartPolicy: {
           Name: 'unless-stopped'
         },
-        Memory: containerInfo.HostConfig.Memory || 2 * 1024 * 1024 * 1024 // 2GB
+        Memory: memory
       }
     });
 
@@ -549,6 +556,9 @@ app.post('/api/servers/:id/version', async (req, res) => {
     metadata.updatedAt = new Date().toISOString();
     await fs.writeJson(metadataPath, metadata, { spaces: 2 });
 
+    // Get memory from metadata
+    let memory = metadata.memory || 2 * 1024 * 1024 * 1024; // default 2GB
+
     // Find available port (reuse existing if possible)
     const gamePort = containerInfo.HostConfig.PortBindings['19132/udp']?.[0]?.HostPort || await findAvailablePort(19132);
 
@@ -573,7 +583,7 @@ app.post('/api/servers/:id/version', async (req, res) => {
         RestartPolicy: {
           Name: 'unless-stopped'
         },
-        Memory: containerInfo.HostConfig.Memory || 2 * 1024 * 1024 * 1024 // 2GB
+        Memory: memory
       }
     });
 
@@ -592,6 +602,98 @@ app.post('/api/servers/:id/version', async (req, res) => {
     });
   } catch (err) {
     console.error('Error updating server version:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/servers/:id/memory - Update server memory
+app.put('/api/servers/:id/memory', async (req, res) => {
+  try {
+    const { memory } = req.body; // memory in MB
+    if (!memory || memory < 256 || memory > 32768) {
+      return res.status(400).json({ error: 'Memory must be between 256MB and 32768MB' });
+    }
+
+    const memoryBytes = memory * 1024 * 1024;
+    const serverId = req.params.id;
+    const serverPath = getServerPath(serverId);
+    const metadataPath = path.join(serverPath, 'metadata.json');
+
+    // Ensure server directory exists
+    if (!await fs.pathExists(serverPath)) {
+      return res.status(404).json({ error: 'Server not found' });
+    }
+
+    // Get container
+    const container = await getContainer(serverId);
+    if (!container) {
+      return res.status(404).json({ error: 'Container not found' });
+    }
+
+    const containerInfo = await container.inspect();
+    const wasRunning = containerInfo.State.Running;
+
+    // Stop container if running
+    if (wasRunning) {
+      await container.stop();
+    }
+
+    // Remove container
+    await container.remove();
+
+    // Update metadata
+    let metadata = {};
+    if (await fs.pathExists(metadataPath)) {
+      metadata = await fs.readJson(metadataPath);
+    }
+    metadata.memory = memoryBytes;
+    metadata.updatedAt = new Date().toISOString();
+    await fs.writeJson(metadataPath, metadata, { spaces: 2 });
+
+    // Find available port (reuse existing if possible)
+    const gamePort = containerInfo.HostConfig.PortBindings['19132/udp']?.[0]?.HostPort || await findAvailablePort(19132);
+
+    // Create new container with updated memory
+    const newContainer = await docker.createContainer({
+      Image: BEDROCK_IMAGE,
+      name: serverId,
+      Labels: {
+        'server-id': serverId,
+        'server-name': metadata.name
+      },
+      Env: [
+        'EULA=TRUE',
+        'VERSION=' + (metadata.version || 'LATEST'),
+        'SERVER_NAME=' + metadata.name
+      ],
+      HostConfig: {
+        Binds: [`${serverPath}:/data`],
+        PortBindings: {
+          '19132/udp': [{ HostPort: gamePort.toString() }]
+        },
+        RestartPolicy: {
+          Name: 'unless-stopped'
+        },
+        Memory: memoryBytes
+      }
+    });
+
+    // Start container if it was running before
+    if (wasRunning) {
+      await newContainer.start();
+    }
+
+    // Broadcast server update
+    setTimeout(() => broadcastServerUpdate(serverId), wasRunning ? 5000 : 1000);
+
+    res.json({
+      message: 'Server memory updated successfully',
+      memory: memory,
+      memoryBytes: memoryBytes,
+      restarted: wasRunning
+    });
+  } catch (err) {
+    console.error('Error updating server memory:', err);
     res.status(500).json({ error: err.message });
   }
 });
