@@ -48,7 +48,7 @@ The aplication will deploy a minecraft bedrock server using docker itzg/docker-m
 - Docker installed
 - Node.js 18+
 - Tested on Linux (Ubuntu & Debian)
-- Made compatible with windows (untested, you tell me)
+- Windows using docker
 
 ### WebSocket Real-time Features
 This application uses WebSocket for real-time updates, providing instant UI synchronization across multiple browser tabs without manual refresh.
@@ -104,66 +104,7 @@ npm run setup
 # Start the app (run on PM2)
 npm start
 ```
-**Access the application at: `http://localhost:3001`**
-
----
-
-### Windows Installation
-
-#### Prerequisites for Windows
-- Docker Desktop for Windows installed and running
-- Node.js 18+ installed
-- Enable Docker TCP (recommended) or use named pipe
-
-#### Docker Desktop Configuration
-1. Open Docker Desktop
-2. Go to Settings → General
-3. Enable "Expose daemon on tcp://localhost:2375 without TLS"
-4. Restart Docker Desktop
-
-#### Windows Installation Steps
-
-##### 1. **Install Dependencies**
-```bash
-# Install backend dependencies (includes WebSocket support)
-npm install
-
-# Note: WebSocket functionality requires socket.io
-
-```
-
-##### 2. **Configure Environment**
-Edit the `.env` file in the root directory:
-```bash
-# Server Configuration
-PORT=3001
-DATA_DIR=C:\MINECRAFTSERVER\data
-
-# Authentication
-LOGIN_PASSWORD=your_secure_password_here
-MAX_LOGIN_ATTEMPTS=5
-LOGIN_LOCKOUT_MINUTES=5
-```
-
-##### 3. **Create Data Directory**
-Create it manually:
-```bash
-# Create directory for server data (Windows Command Prompt)
-mkdir "C:\MINECRAFTSERVER\data"
-```
-
-##### 4. **WebSocket Setup**
-```bash
-# Run WebSocket setup 
-npm run setup
-```
-
-##### 5. **Start the Application**
-```bash
-# Start the app
-npm start
-```
-**Access the application at: `http://localhost:3001`**
+**Access the application at: `http://localhost:3001`**
 
 ---
 
@@ -172,6 +113,13 @@ npm start
 #### Prerequisites
 - Docker installed
 - Docker Compose installed
+
+#### Docker Desktop Configuration
+1. Open Docker Desktop
+2. Go to Settings → General
+3. Enable "Expose daemon on tcp://localhost:2375 without TLS"
+4. Restart Docker Desktop
+
 
 Image : https://hub.docker.com/r/mugh/bdsmanagerforitzg
 
