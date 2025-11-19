@@ -43,12 +43,7 @@ The aplication will deploy a minecraft bedrock server using docker itzg/docker-m
 - ✅ Password-protected login
 - ✅ Session-based authentication
 - ✅ Mobile responsive design
-
-### Prerequisites
-- Docker installed
-- Node.js 18+
-- Tested on Linux (Ubuntu & Debian)
-- Windows using docker
+
 
 ### WebSocket Real-time Features
 This application uses WebSocket for real-time updates, providing instant UI synchronization across multiple browser tabs without manual refresh.
@@ -62,14 +57,19 @@ This application uses WebSocket for real-time updates, providing instant UI sync
 ---
 
 ### Linux Installation
+
+#### Prerequisites
+- Docker installed
+- Node.js 18+
+- Tested on Linux (Ubuntu & Debian)
+- Windows using docker
+
 Download the source  code
 
 #### 1. **Install Dependencies**
 ```bash
 # Install backend dependencies (includes WebSocket support)
-npm install
-
-# Note: WebSocket functionality requires socket.io
+npm install
 
 ```
 
