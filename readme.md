@@ -191,7 +191,7 @@ services:
       - LOGIN_PASSWORD=minecraft123
       - MAX_LOGIN_ATTEMPTS=5
       - LOGIN_LOCKOUT_MINUTES=5
-      #- DOCKER_HOST=tcp://host.docker.internal:2375 for windows only
+      #- DOCKER_HOST=tcp://host.docker.internal:2375 #for system with restricted direct mounting to /var/run/docker.sock (windows or NAS)
     networks:
       - minecraft-network
 
@@ -229,6 +229,7 @@ You can customize the deployment by editing the `docker-compose.yml` file:
 ![enter image description here](https://github.com/mugh/minecraftbedrockservermanager/blob/main/Screenshot/sc2.png?raw=true)
 ![enter image description here](https://github.com/mugh/minecraftbedrockservermanager/blob/main/Screenshot/sc3.png?raw=true)
 ![enter image description here](https://github.com/mugh/minecraftbedrockservermanager/blob/main/Screenshot/sc4.png?raw=true)
+
 
 
 
