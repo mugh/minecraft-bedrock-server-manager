@@ -292,6 +292,22 @@ app.post('/api/servers', async (req, res) => {
     // Find available port
     const gamePort = await findAvailablePort(19132);
 
+    // Pull the Docker image if not available
+    try {
+      console.log(`Pulling Docker image: ${BEDROCK_IMAGE}`);
+      const stream = await docker.pull(BEDROCK_IMAGE);
+      await new Promise((resolve, reject) => {
+        docker.modem.followProgress(stream, (err, output) => {
+          if (err) reject(err);
+          else resolve(output);
+        });
+      });
+      console.log(`Successfully pulled image: ${BEDROCK_IMAGE}`);
+    } catch (pullErr) {
+      console.error('Failed to pull Docker image:', pullErr);
+      // Continue anyway, as the image might already exist or pull might fail but image is available
+    }
+
     // Create container
     const container = await docker.createContainer({
       Image: BEDROCK_IMAGE,
@@ -537,6 +553,22 @@ app.post('/api/servers/:id/rename', async (req, res) => {
     const hostDataPath = await getHostDataPath();
     const hostServerPath = path.join(hostDataPath, serverId);
 
+    // Pull the Docker image if not available
+    try {
+      console.log(`Pulling Docker image: ${BEDROCK_IMAGE}`);
+      const stream = await docker.pull(BEDROCK_IMAGE);
+      await new Promise((resolve, reject) => {
+        docker.modem.followProgress(stream, (err, output) => {
+          if (err) reject(err);
+          else resolve(output);
+        });
+      });
+      console.log(`Successfully pulled image: ${BEDROCK_IMAGE}`);
+    } catch (pullErr) {
+      console.error('Failed to pull Docker image:', pullErr);
+      // Continue anyway, as the image might already exist or pull might fail but image is available
+    }
+
     // Create new container with updated server name
     const newContainer = await docker.createContainer({
       Image: BEDROCK_IMAGE,
@@ -726,6 +758,22 @@ app.put('/api/servers/:id/memory', async (req, res) => {
 
     const hostDataPath = await getHostDataPath();
     const hostServerPath = path.join(hostDataPath, serverId);
+
+    // Pull the Docker image if not available
+    try {
+      console.log(`Pulling Docker image: ${BEDROCK_IMAGE}`);
+      const stream = await docker.pull(BEDROCK_IMAGE);
+      await new Promise((resolve, reject) => {
+        docker.modem.followProgress(stream, (err, output) => {
+          if (err) reject(err);
+          else resolve(output);
+        });
+      });
+      console.log(`Successfully pulled image: ${BEDROCK_IMAGE}`);
+    } catch (pullErr) {
+      console.error('Failed to pull Docker image:', pullErr);
+      // Continue anyway, as the image might already exist or pull might fail but image is available
+    }
 
     // Create new container with updated memory
     const newContainer = await docker.createContainer({
