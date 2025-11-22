@@ -266,6 +266,159 @@ app.get('/api/servers', async (req, res) => {
   }
 });
 
+// POST /api/servers/import - Import existing server
+app.post('/api/servers/import', async (req, res) => {
+  try {
+    const { containerName } = req.body;
+    if (!containerName || !containerName.trim()) {
+      return res.status(400).json({ error: 'Container name is required' });
+    }
+
+    const trimmedName = containerName.trim();
+
+    // Find the container by name
+    const containers = await docker.listContainers({ all: true });
+    const containerInfo = containers.find(c => c.Names && c.Names.includes(`/${trimmedName}`));
+
+    if (!containerInfo) {
+      return res.status(404).json({ error: 'Container not found' });
+    }
+
+    // Check if it's the correct image
+    if (!containerInfo.Image.includes(BEDROCK_IMAGE)) {
+      return res.status(400).json({ error: 'Container is not a Minecraft Bedrock server' });
+    }
+
+    // Inspect the container
+    const container = docker.getContainer(containerInfo.Id);
+    const details = await container.inspect();
+
+    // Find the data mount
+    const dataMount = details.Mounts?.find(m => m.Destination === '/data');
+    if (!dataMount) {
+      return res.status(400).json({ error: 'Container does not have a /data mount' });
+    }
+
+    const sourceDataPath = dataMount.Source;
+
+    // Verify the structure
+    const serverPropertiesPath = path.join(sourceDataPath, 'server.properties');
+    const worldsPath = path.join(sourceDataPath, 'worlds');
+
+    if (!(await fs.pathExists(serverPropertiesPath))) {
+      return res.status(400).json({ error: 'Invalid server structure: server.properties not found' });
+    }
+
+    if (!(await fs.pathExists(worldsPath))) {
+      return res.status(400).json({ error: 'Invalid server structure: worlds directory not found' });
+    }
+
+    // Get server name and version from the source
+    let serverName = details.Config.Env?.find(env => env.startsWith('SERVER_NAME='))?.split('=')[1] || trimmedName;
+    let serverVersion = details.Config.Env?.find(env => env.startsWith('VERSION='))?.split('=')[1] || 'LATEST';
+
+    // Create new server
+    const serverId = `bedrock-${Date.now()}`;
+    const serverPath = getServerPath(serverId);
+    const hostDataPath = await getHostDataPath();
+    const hostServerPath = path.join(hostDataPath, serverId);
+
+    // Create server directory
+    await fs.ensureDir(serverPath);
+
+    // Stop the original container before copying data
+    console.log(`Stopping original container: ${trimmedName}`);
+    try {
+      if (details.State.Status === 'running') {
+        await container.stop();
+        console.log(`Stopped container: ${trimmedName}`);
+      }
+    } catch (stopErr) {
+      console.warn(`Failed to stop container ${trimmedName}:`, stopErr.message);
+      // Continue anyway
+    }
+
+    // Copy data from source to new server folder
+    console.log(`Copying data from ${sourceDataPath} to ${serverPath}`);
+    await fs.copy(sourceDataPath, serverPath, { overwrite: true });
+
+    // Update metadata
+    const metadataPath = path.join(serverPath, 'metadata.json');
+    let metadata = {};
+    if (await fs.pathExists(metadataPath)) {
+      metadata = await fs.readJson(metadataPath);
+    }
+    metadata.name = serverName;
+    metadata.version = serverVersion;
+    metadata.memory = details.HostConfig.Memory || 2 * 1024 * 1024 * 1024; // default 2GB
+    metadata.createdAt = new Date().toISOString();
+    metadata.updatedAt = new Date().toISOString();
+    metadata.importedFrom = trimmedName;
+    await fs.writeJson(metadataPath, metadata, { spaces: 2 });
+
+    // Find available port
+    const gamePort = await findAvailablePort(19132);
+
+    // Pull the Docker image if not available
+    try {
+      console.log(`Pulling Docker image: ${BEDROCK_IMAGE}`);
+      const stream = await docker.pull(BEDROCK_IMAGE);
+      await new Promise((resolve, reject) => {
+        docker.modem.followProgress(stream, (err, output) => {
+          if (err) reject(err);
+          else resolve(output);
+        });
+      });
+      console.log(`Successfully pulled image: ${BEDROCK_IMAGE}`);
+    } catch (pullErr) {
+      console.error('Failed to pull Docker image:', pullErr);
+      // Continue anyway
+    }
+
+    // Create new container
+    const newContainer = await docker.createContainer({
+      Image: BEDROCK_IMAGE,
+      name: serverId,
+      Labels: {
+        'server-id': serverId,
+        'server-name': serverName
+      },
+      Env: [
+        'EULA=TRUE',
+        'VERSION=' + serverVersion,
+        'SERVER_NAME=' + serverName
+      ],
+      HostConfig: {
+        Binds: [`${hostServerPath}:/data`],
+        PortBindings: {
+          '19132/udp': [{ HostPort: gamePort.toString() }]
+        },
+        RestartPolicy: {
+          Name: 'unless-stopped'
+        },
+        Memory: metadata.memory
+      }
+    });
+
+    // Start the new container
+    await newContainer.start();
+
+    // Broadcast server update
+    setTimeout(() => broadcastServerUpdate(serverId), 2000);
+
+    res.json({
+      id: serverId,
+      name: serverName,
+      version: serverVersion,
+      gamePort,
+      message: 'Server imported successfully'
+    });
+  } catch (err) {
+    console.error('Import error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/servers - Create new server
 app.post('/api/servers', async (req, res) => {
   try {

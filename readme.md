@@ -10,6 +10,7 @@ The aplication will deploy a minecraft bedrock server using docker itzg/docker-m
 ### Features
 - ✅ Real-time WebSocket Updates
 - ✅ Multiple server management
+- ✅ Imprt current itzg container server
 - ✅ Select server version (Latest, Latest Preview or custom)
 - ✅ Start/Stop/Restart containers
 - ✅ Server renaming
@@ -43,7 +44,8 @@ The aplication will deploy a minecraft bedrock server using docker itzg/docker-m
 - ✅ Password-protected login
 - ✅ Session-based authentication
 - ✅ Mobile responsive design
-
+
+
 
 ### WebSocket Real-time Features
 This application uses WebSocket for real-time updates, providing instant UI synchronization across multiple browser tabs without manual refresh.
@@ -67,7 +69,8 @@ Download the source  code
 #### 1. **Install Dependencies**
 ```bash
 # Install backend dependencies (includes WebSocket support)
-npm install
+npm install
+
 
 ```
 
@@ -102,7 +105,8 @@ npm run setup
 # Start the app (run on PM2)
 npm start
 ```
-**Access the application at: `http://localhost:3001`**
+**Access the application at: `http://localhost:3001`**
+
 
 ---
 

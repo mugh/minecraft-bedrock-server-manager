@@ -267,6 +267,25 @@
         </div>
     </div>
 
+    <!-- Import Server Modal -->
+    <div id="importModal" class="modal">
+        <div class="bg-gray-800 rounded-lg p-4 w-96">
+            <h3 class="text-lg font-semibold mb-3">📥 Import Existing Server</h3>
+            <div class="mb-3">
+                <label class="block text-sm text-gray-400 mb-2">Container Name</label>
+                <input type="text" id="importContainerName" placeholder="e.g. my-bedrock-server" class="w-full px-3 py-1.5 text-sm bg-gray-900 border border-gray-700 rounded-lg">
+            </div>
+            <div class="text-xs text-gray-500 mb-3">
+                <p>💡 Import an existing itzg/minecraft-bedrock-server container to manage it with this interface.</p>
+                <p>The container must be running and contain valid Minecraft Bedrock server data.</p>
+            </div>
+            <div class="flex gap-2">
+                <button onclick="importServer()" class="flex-1 px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 rounded-lg">Import</button>
+                <button onclick="closeModal('importModal')" class="flex-1 px-3 py-1.5 text-sm bg-gray-700 hover:bg-gray-600 rounded-lg">Cancel</button>
+            </div>
+        </div>
+    </div>
+
 
     <!-- Loading Overlay -->
     <div id="loadingOverlay" class="loading-overlay hidden">
@@ -2309,10 +2328,16 @@
                                 <div class="text-xs text-gray-500">By mughniy</div>
                             </div>
                         </div>
-                        <button onclick="createServer()" class="px-2 md:px-3 py-1.5 text-xs md:text-sm bg-green-600 hover:bg-green-700 rounded-lg">
-                            <span class="hidden sm:inline">+ New Server</span>
-                            <span class="sm:hidden">+</span>
-                        </button>
+                        <div class="flex gap-2">
+                            <button onclick="createServer()" class="px-2 md:px-3 py-1.5 text-xs md:text-sm bg-green-600 hover:bg-green-700 rounded-lg">
+                                <span class="hidden sm:inline">+ New Server</span>
+                                <span class="sm:hidden">+</span>
+                            </button>
+                            <button onclick="showImportModal()" class="px-2 md:px-3 py-1.5 text-xs md:text-sm bg-blue-600 hover:bg-blue-700 rounded-lg">
+                                <span class="hidden sm:inline">📥 Import</span>
+                                <span class="sm:hidden">📥</span>
+                            </button>
+                        </div>
                     </div>
                 </div>
 
@@ -2966,6 +2991,60 @@
 
         function hideLoading() {
             document.getElementById('loadingOverlay').classList.add('hidden');
+        }
+
+        function showImportModal() {
+            document.getElementById('importContainerName').value = '';
+            openModal('importModal');
+        }
+
+        async function importServer() {
+            const containerName = document.getElementById('importContainerName').value.trim();
+            if (!containerName) {
+                Swal.fire({
+                    title: 'Container Name Required',
+                    text: 'Please enter the container name to import',
+                    icon: 'warning',
+                    confirmButtonColor: '#10b981'
+                });
+                return;
+            }
+
+            try {
+                showLoading();
+                const response = await fetch(`${API_BASE}/servers/import`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ containerName })
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    closeModal('importModal');
+                    await fetchServers();
+                    hideLoading();
+                    Swal.fire({
+                        title: 'Success',
+                        text: 'Server imported successfully!',
+                        icon: 'success',
+                        confirmButtonColor: '#10b981',
+                        timer: 2000,
+                        timerProgressBar: true
+                    });
+                } else {
+                    hideLoading();
+                    throw new Error(result.error || 'Import failed');
+                }
+            } catch (err) {
+                hideLoading();
+                Swal.fire({
+                    title: 'Import Failed',
+                    text: 'Import failed: ' + err.message,
+                    icon: 'error',
+                    confirmButtonColor: '#10b981'
+                });
+            }
         }
 
         // Initialize
