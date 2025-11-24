@@ -1904,7 +1904,8 @@ function generatePackFolderName(addonName, suffix) {
     baseName = 'unknown_addon';
   }
 
-  return `${baseName}_${suffix}`;
+  // Only add suffix if it's provided and not empty
+  return suffix ? `${baseName}_${suffix}` : baseName;
 }
 
 // Helper: Generate unique folder name with conflict resolution
@@ -1927,33 +1928,36 @@ app.get('/api/servers/:id/addons', async (req, res) => {
     const paths = getAddonPaths(req.params.id);
     await fs.ensureDir(paths.behaviorPacks);
     await fs.ensureDir(paths.resourcePacks);
-    
+
     const behaviorPacks = await fs.readdir(paths.behaviorPacks);
     const resourcePacks = await fs.readdir(paths.resourcePacks);
-    
+
     const worldName = await getWorldName(req.params.id);
     const worldPath = path.join(paths.worlds, worldName);
-    
+
     // Read enabled packs from world config
     let enabledBehaviorPacks = [];
     let enabledResourcePacks = [];
-    
+
     const behaviorConfigPath = path.join(worldPath, 'world_behavior_packs.json');
     const resourceConfigPath = path.join(worldPath, 'world_resource_packs.json');
-    
+
     if (await fs.pathExists(behaviorConfigPath)) {
       enabledBehaviorPacks = await fs.readJson(behaviorConfigPath);
     }
-    
+
     if (await fs.pathExists(resourceConfigPath)) {
       enabledResourcePacks = await fs.readJson(resourceConfigPath);
     }
-    
+
+    // Create a map to combine addons by name
+    const addonMap = new Map();
+
     // Process behavior packs
-    const behaviorPacksList = await Promise.all(behaviorPacks.map(async pack => {
+    await Promise.all(behaviorPacks.map(async pack => {
       const packPath = path.join(paths.behaviorPacks, pack);
       const stats = await fs.stat(packPath);
-      
+
       let manifest = null;
       const manifestPath = path.join(packPath, 'manifest.json');
       if (await fs.pathExists(manifestPath)) {
@@ -1964,12 +1968,14 @@ app.get('/api/servers/:id/addons', async (req, res) => {
           // Continue without manifest data
         }
       }
-      
+
       const isEnabled = manifest && enabledBehaviorPacks.some(p => p.pack_id === manifest.header.uuid);
-      
-      return {
-        name: pack,
-        type: 'behavior',
+
+      if (!addonMap.has(pack)) {
+        addonMap.set(pack, { name: pack, behaviorPack: null, resourcePack: null });
+      }
+
+      addonMap.get(pack).behaviorPack = {
         enabled: isEnabled,
         uuid: manifest?.header?.uuid || null,
         version: manifest?.header?.version || null,
@@ -1978,12 +1984,12 @@ app.get('/api/servers/:id/addons', async (req, res) => {
         modified: stats.mtime
       };
     }));
-    
+
     // Process resource packs
-    const resourcePacksList = await Promise.all(resourcePacks.map(async pack => {
+    await Promise.all(resourcePacks.map(async pack => {
       const packPath = path.join(paths.resourcePacks, pack);
       const stats = await fs.stat(packPath);
-      
+
       let manifest = null;
       const manifestPath = path.join(packPath, 'manifest.json');
       if (await fs.pathExists(manifestPath)) {
@@ -1994,12 +2000,14 @@ app.get('/api/servers/:id/addons', async (req, res) => {
           // Continue without manifest data
         }
       }
-      
+
       const isEnabled = manifest && enabledResourcePacks.some(p => p.pack_id === manifest.header.uuid);
-      
-      return {
-        name: pack,
-        type: 'resource',
+
+      if (!addonMap.has(pack)) {
+        addonMap.set(pack, { name: pack, behaviorPack: null, resourcePack: null });
+      }
+
+      addonMap.get(pack).resourcePack = {
         enabled: isEnabled,
         uuid: manifest?.header?.uuid || null,
         version: manifest?.header?.version || null,
@@ -2008,11 +2016,11 @@ app.get('/api/servers/:id/addons', async (req, res) => {
         modified: stats.mtime
       };
     }));
-    
-    res.json({
-      behaviorPacks: behaviorPacksList,
-      resourcePacks: resourcePacksList
-    });
+
+    // Convert map to array
+    const addons = Array.from(addonMap.values());
+
+    res.json(addons);
   } catch (err) {
     console.error('Error listing addons:', err);
     res.status(500).json({ error: err.message });
@@ -2120,6 +2128,10 @@ app.post('/api/servers/:id/addons/upload', addonUpload.single('addon'), async (r
       const extractedItems = await fs.readdir(tempExtractPath);
       let processedItems = 0;
 
+      // Generate base name for this mcaddon file (without suffix)
+      const baseName = path.basename(originalName, ext).replace(/[^a-zA-Z0-9\s\-_]/g, '').replace(/\s+/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '');
+      const addonBaseName = baseName || 'unknown_addon';
+
       for (const item of extractedItems) {
         const itemPath = path.join(tempExtractPath, item);
         const stats = await fs.stat(itemPath);
@@ -2129,7 +2141,7 @@ app.post('/api/servers/:id/addons/upload', addonUpload.single('addon'), async (r
             const behaviorItems = await fs.readdir(itemPath);
             for (const pack of behaviorItems) {
               const sourcePath = path.join(itemPath, pack);
-              const folderName = await generateUniquePackFolderName(paths.behaviorPacks, originalName, 'bp');
+              const folderName = await generateUniquePackFolderName(paths.behaviorPacks, addonBaseName, '');
               const destPath = path.join(paths.behaviorPacks, folderName);
               await fs.copy(sourcePath, destPath, { overwrite: true });
               processedItems++;
@@ -2138,7 +2150,7 @@ app.post('/api/servers/:id/addons/upload', addonUpload.single('addon'), async (r
             const resourceItems = await fs.readdir(itemPath);
             for (const pack of resourceItems) {
               const sourcePath = path.join(itemPath, pack);
-              const folderName = await generateUniquePackFolderName(paths.resourcePacks, originalName, 'rp');
+              const folderName = await generateUniquePackFolderName(paths.resourcePacks, addonBaseName, '');
               const destPath = path.join(paths.resourcePacks, folderName);
               await fs.copy(sourcePath, destPath, { overwrite: true });
               processedItems++;
@@ -2151,13 +2163,12 @@ app.post('/api/servers/:id/addons/upload', addonUpload.single('addon'), async (r
                 const modules = manifest.modules || [];
                 const isBehavior = modules.some(m => m.type === 'data' || m.type === 'javascript' || m.type === 'script');
                 const targetPath = isBehavior ? paths.behaviorPacks : paths.resourcePacks;
-                const suffix = isBehavior ? 'bp' : 'rp';
-                const folderName = await generateUniquePackFolderName(targetPath, originalName, suffix);
+                const folderName = await generateUniquePackFolderName(targetPath, addonBaseName, '');
                 const destPath = path.join(targetPath, folderName);
                 await fs.copy(itemPath, destPath, { overwrite: true });
                 processedItems++;
               } catch (err) {
-                const folderName = await generateUniquePackFolderName(paths.resourcePacks, originalName, 'rp');
+                const folderName = await generateUniquePackFolderName(paths.resourcePacks, addonBaseName, '');
                 const destPath = path.join(paths.resourcePacks, folderName);
                 await fs.copy(itemPath, destPath, { overwrite: true });
                 processedItems++;
@@ -2182,7 +2193,7 @@ app.post('/api/servers/:id/addons/upload', addonUpload.single('addon'), async (r
 
       if (await fs.pathExists(manifestPath)) {
         // Direct content: create folder and move content into it
-        const folderName = await generateUniquePackFolderName(targetDir, originalName, 'rp');
+        const folderName = await generateUniquePackFolderName(targetDir, baseName, '');
         const newFolderPath = path.join(tempExtractPath, folderName);
         await fs.ensureDir(newFolderPath);
 
@@ -2201,7 +2212,7 @@ app.post('/api/servers/:id/addons/upload', addonUpload.single('addon'), async (r
           const itemPath = path.join(tempExtractPath, item);
           const stats = await fs.stat(itemPath);
           if (stats.isDirectory()) {
-            const folderName = await generateUniquePackFolderName(targetDir, originalName, 'rp');
+            const folderName = await generateUniquePackFolderName(targetDir, baseName, '');
             const destPath = path.join(targetDir, folderName);
             await fs.copy(itemPath, destPath, { overwrite: true });
           }
@@ -2269,71 +2280,132 @@ app.post('/api/servers/:id/addons/upload', addonUpload.single('addon'), async (r
   }
 });
 
-// POST /api/servers/:id/addons/:type/:name/toggle - Enable/disable addon
-app.post('/api/servers/:id/addons/:type/:name/toggle', async (req, res) => {
+// POST /api/servers/:id/addons/:name/toggle - Enable/disable addon
+app.post('/api/servers/:id/addons/:name/toggle', async (req, res) => {
   try {
-    const { type, name } = req.params;
+    const { name } = req.params;
     const paths = getAddonPaths(req.params.id);
-    
-    const packPath = type === 'behavior' 
-      ? path.join(paths.behaviorPacks, name)
-      : path.join(paths.resourcePacks, name);
-    
-    // Read manifest
-    const manifestPath = path.join(packPath, 'manifest.json');
-    if (!await fs.pathExists(manifestPath)) {
-      return res.status(404).json({ error: 'Manifest not found' });
-    }
-    
-    let manifest;
-    try {
-      manifest = await parseManifestJson(manifestPath);
-    } catch (err) {
-      return res.status(400).json({ error: 'Invalid manifest.json: ' + err.message });
-    }
-    
-    const uuid = manifest.header.uuid;
-    const version = manifest.header.version;
-    
+
     // Get world path
     const worldName = await getWorldName(req.params.id);
     const worldPath = path.join(paths.worlds, worldName);
     await fs.ensureDir(worldPath);
-    
-    // Determine config file
-    const configFile = type === 'behavior' 
-      ? path.join(worldPath, 'world_behavior_packs.json')
-      : path.join(worldPath, 'world_resource_packs.json');
-    
-    // Read current config
-    let packs = [];
-    if (await fs.pathExists(configFile)) {
-      packs = await fs.readJson(configFile);
+
+    let toggledBehavior = false;
+    let toggledResource = false;
+    let behaviorEnabled = false;
+    let resourceEnabled = false;
+
+    // Handle behavior pack if it exists
+    const behaviorPackPath = path.join(paths.behaviorPacks, name);
+    if (await fs.pathExists(behaviorPackPath)) {
+      const manifestPath = path.join(behaviorPackPath, 'manifest.json');
+      if (await fs.pathExists(manifestPath)) {
+        let manifest;
+        try {
+          manifest = await parseManifestJson(manifestPath);
+        } catch (err) {
+          console.warn(`Failed to parse manifest for behavior pack ${name}:`, err.message);
+          // Continue without manifest data
+        }
+
+        if (manifest?.header?.uuid) {
+          const uuid = manifest.header.uuid;
+          const version = manifest.header.version;
+
+          const configFile = path.join(worldPath, 'world_behavior_packs.json');
+          let packs = [];
+          if (await fs.pathExists(configFile)) {
+            packs = await fs.readJson(configFile);
+          }
+
+          const packIndex = packs.findIndex(p => p.pack_id === uuid);
+
+          if (packIndex >= 0) {
+            // Disable - remove from list
+            packs.splice(packIndex, 1);
+            behaviorEnabled = false;
+          } else {
+            // Enable - add to list
+            packs.push({
+              pack_id: uuid,
+              version: version
+            });
+            behaviorEnabled = true;
+          }
+
+          // Save config
+          await fs.writeJson(configFile, packs, { spaces: 2 });
+          toggledBehavior = true;
+        }
+      }
     }
-    
-    // Toggle pack
-    const packIndex = packs.findIndex(p => p.pack_id === uuid);
-    
-    if (packIndex >= 0) {
-      // Disable - remove from list
-      packs.splice(packIndex, 1);
-    } else {
-      // Enable - add to list
-      packs.push({
-        pack_id: uuid,
-        version: version
-      });
+
+    // Handle resource pack if it exists
+    const resourcePackPath = path.join(paths.resourcePacks, name);
+    if (await fs.pathExists(resourcePackPath)) {
+      const manifestPath = path.join(resourcePackPath, 'manifest.json');
+      if (await fs.pathExists(manifestPath)) {
+        let manifest;
+        try {
+          manifest = await parseManifestJson(manifestPath);
+        } catch (err) {
+          console.warn(`Failed to parse manifest for resource pack ${name}:`, err.message);
+          // Continue without manifest data
+        }
+
+        if (manifest?.header?.uuid) {
+          const uuid = manifest.header.uuid;
+          const version = manifest.header.version;
+
+          const configFile = path.join(worldPath, 'world_resource_packs.json');
+          let packs = [];
+          if (await fs.pathExists(configFile)) {
+            packs = await fs.readJson(configFile);
+          }
+
+          const packIndex = packs.findIndex(p => p.pack_id === uuid);
+
+          if (packIndex >= 0) {
+            // Disable - remove from list
+            packs.splice(packIndex, 1);
+            resourceEnabled = false;
+          } else {
+            // Enable - add to list
+            packs.push({
+              pack_id: uuid,
+              version: version
+            });
+            resourceEnabled = true;
+          }
+
+          // Save config
+          await fs.writeJson(configFile, packs, { spaces: 2 });
+          toggledResource = true;
+        }
+      }
     }
-    
-    // Save config
-    await fs.writeJson(configFile, packs, { spaces: 2 });
+
+    if (!toggledBehavior && !toggledResource) {
+      return res.status(404).json({ error: 'Addon not found' });
+    }
 
     // Broadcast server details update (addons changed)
     setTimeout(() => broadcastServerDetails(req.params.id), 500);
 
+    let message = '';
+    if (toggledBehavior && toggledResource) {
+      message = behaviorEnabled || resourceEnabled ? 'Addon enabled' : 'Addon disabled';
+    } else if (toggledBehavior) {
+      message = behaviorEnabled ? 'Behavior pack enabled' : 'Behavior pack disabled';
+    } else if (toggledResource) {
+      message = resourceEnabled ? 'Resource pack enabled' : 'Resource pack disabled';
+    }
+
     res.json({
-      message: packIndex >= 0 ? 'Addon disabled' : 'Addon enabled',
-      enabled: packIndex < 0
+      message: message,
+      behaviorEnabled: behaviorEnabled,
+      resourceEnabled: resourceEnabled
     });
   } catch (err) {
     console.error('Error toggling addon:', err);
@@ -2341,53 +2413,117 @@ app.post('/api/servers/:id/addons/:type/:name/toggle', async (req, res) => {
   }
 });
 
-// DELETE /api/servers/:id/addons/:type/:name - Delete addon
-app.delete('/api/servers/:id/addons/:type/:name', async (req, res) => {
+// DELETE /api/servers/:id/addons/:name - Delete addon
+app.delete('/api/servers/:id/addons/:name', async (req, res) => {
   try {
-    const { type, name } = req.params;
+    const { name } = req.params;
     const paths = getAddonPaths(req.params.id);
 
-    const packPath = type === 'behavior'
-      ? path.join(paths.behaviorPacks, name)
-      : path.join(paths.resourcePacks, name);
+    let deletedBehavior = false;
+    let deletedResource = false;
+    let disabledBehavior = false;
+    let disabledResource = false;
 
-    if (!await fs.pathExists(packPath)) {
+    // Get world path for config management
+    const worldName = await getWorldName(req.params.id);
+    const worldPath = path.join(paths.worlds, worldName);
+    await fs.ensureDir(worldPath);
+
+    // Handle behavior pack if it exists
+    const behaviorPackPath = path.join(paths.behaviorPacks, name);
+    if (await fs.pathExists(behaviorPackPath)) {
+      // Read manifest to get UUID
+      let uuid = null;
+      const manifestPath = path.join(behaviorPackPath, 'manifest.json');
+      if (await fs.pathExists(manifestPath)) {
+        try {
+          const manifest = await parseManifestJson(manifestPath);
+          uuid = manifest?.header?.uuid || null;
+        } catch (err) {
+          console.warn(`Failed to parse manifest for behavior pack ${name}:`, err.message);
+          // Continue with deletion even if manifest can't be parsed
+        }
+      }
+
+      // Disable from world config if enabled and we have UUID
+      if (uuid) {
+        const configFile = path.join(worldPath, 'world_behavior_packs.json');
+        if (await fs.pathExists(configFile)) {
+          let packs = await fs.readJson(configFile);
+          const packIndex = packs.findIndex(p => p.pack_id === uuid);
+          if (packIndex >= 0) {
+            // Remove the pack from config (disable it)
+            packs.splice(packIndex, 1);
+            await fs.writeJson(configFile, packs, { spaces: 2 });
+            disabledBehavior = true;
+          }
+        }
+      }
+
+      // Remove from filesystem
+      await fs.remove(behaviorPackPath);
+      deletedBehavior = true;
+    }
+
+    // Handle resource pack if it exists
+    const resourcePackPath = path.join(paths.resourcePacks, name);
+    if (await fs.pathExists(resourcePackPath)) {
+      // Read manifest to get UUID
+      let uuid = null;
+      const manifestPath = path.join(resourcePackPath, 'manifest.json');
+      if (await fs.pathExists(manifestPath)) {
+        try {
+          const manifest = await parseManifestJson(manifestPath);
+          uuid = manifest?.header?.uuid || null;
+        } catch (err) {
+          console.warn(`Failed to parse manifest for resource pack ${name}:`, err.message);
+          // Continue with deletion even if manifest can't be parsed
+        }
+      }
+
+      // Disable from world config if enabled and we have UUID
+      if (uuid) {
+        const configFile = path.join(worldPath, 'world_resource_packs.json');
+        if (await fs.pathExists(configFile)) {
+          let packs = await fs.readJson(configFile);
+          const packIndex = packs.findIndex(p => p.pack_id === uuid);
+          if (packIndex >= 0) {
+            // Remove the pack from config (disable it)
+            packs.splice(packIndex, 1);
+            await fs.writeJson(configFile, packs, { spaces: 2 });
+            disabledResource = true;
+          }
+        }
+      }
+
+      // Remove from filesystem
+      await fs.remove(resourcePackPath);
+      deletedResource = true;
+    }
+
+    if (!deletedBehavior && !deletedResource) {
       return res.status(404).json({ error: 'Addon not found' });
     }
 
-    // Read manifest to get UUID before deleting
-    let uuid = null;
-    const manifestPath = path.join(packPath, 'manifest.json');
-    if (await fs.pathExists(manifestPath)) {
-      try {
-        const manifest = await parseManifestJson(manifestPath);
-        uuid = manifest?.header?.uuid || null;
-      } catch (err) {
-        console.warn(`Failed to parse manifest for ${name}:`, err.message);
-        // Continue with deletion even if manifest can't be parsed
+    let message = 'Addon deleted successfully';
+    if (deletedBehavior && deletedResource) {
+      message = 'Behavior pack and resource pack deleted successfully';
+      if (disabledBehavior || disabledResource) {
+        message += ' (previously active packs were disabled first)';
+      }
+    } else if (deletedBehavior) {
+      message = 'Behavior pack deleted successfully';
+      if (disabledBehavior) {
+        message += ' (was disabled first)';
+      }
+    } else if (deletedResource) {
+      message = 'Resource pack deleted successfully';
+      if (disabledResource) {
+        message += ' (was disabled first)';
       }
     }
 
-    // Remove from world config if enabled and we have UUID
-    if (uuid) {
-      const worldName = await getWorldName(req.params.id);
-      const worldPath = path.join(paths.worlds, worldName);
-      const configFile = type === 'behavior'
-        ? path.join(worldPath, 'world_behavior_packs.json')
-        : path.join(worldPath, 'world_resource_packs.json');
-
-      if (await fs.pathExists(configFile)) {
-        let packs = await fs.readJson(configFile);
-        // Remove the pack from config if it exists
-        packs = packs.filter(p => p.pack_id !== uuid);
-        await fs.writeJson(configFile, packs, { spaces: 2 });
-      }
-    }
-
-    // Remove from filesystem
-    await fs.remove(packPath);
-
-    res.json({ message: 'Addon deleted successfully' });
+    res.json({ message: message });
   } catch (err) {
     console.error('Error deleting addon:', err);
     res.status(500).json({ error: err.message });
