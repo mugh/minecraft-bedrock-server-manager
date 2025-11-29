@@ -7,11 +7,232 @@ const Docker = require('dockerode');
 const fs = require('fs-extra');
 const path = require('path');
 const archiver = require('archiver');
-const unzipper = require('unzipper');
+const AdmZip = require('adm-zip');
 const fsPromises = require('fs').promises;
 const multer = require('multer');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
+
+// Caching for server info and file operations
+const serverCache = new Map();
+const fileCache = new Map();
+const CACHE_TTL = 30000; // 30 seconds
+
+// Debounce function for broadcasts
+function debounce(func, wait) {
+  let timeout;
+  return function executedFunction(...args) {
+    const later = () => {
+      clearTimeout(timeout);
+      func(...args);
+    };
+    clearTimeout(timeout);
+    timeout = setTimeout(later, wait);
+  };
+}
+
+// Cached file read helper
+async function readCachedFile(filePath, parser = 'text') {
+  const cacheKey = `${filePath}:${parser}`;
+  const now = Date.now();
+  const cached = fileCache.get(cacheKey);
+  if (cached && (now - cached.timestamp) < CACHE_TTL) {
+    return cached.data;
+  }
+
+  try {
+    let data;
+    if (parser === 'json') {
+      data = await fs.readJson(filePath);
+    } else {
+      data = await fs.readFile(filePath, 'utf8');
+    }
+    fileCache.set(cacheKey, { data, timestamp: now });
+    return data;
+  } catch (err) {
+    throw err;
+  }
+}
+
+// Invalidate file cache
+function invalidateFileCache(filePath) {
+  for (const key of fileCache.keys()) {
+    if (key.startsWith(filePath)) {
+      fileCache.delete(key);
+    }
+  }
+}
+
+// Cached server info
+async function getCachedServerInfo(serverId) {
+  const cacheKey = `server:${serverId}`;
+  const now = Date.now();
+  const cached = serverCache.get(cacheKey);
+  if (cached && (now - cached.timestamp) < CACHE_TTL) {
+    return cached.data;
+  }
+
+  // Fetch fresh data
+  const container = await getContainer(serverId);
+  if (!container) return null;
+
+  const info = await container.inspect();
+  const serverPath = getServerPath(serverId);
+
+  // Get metadata
+  let metadata = {};
+  try {
+    const metadataPath = path.join(serverPath, 'metadata.json');
+    metadata = await readCachedFile(metadataPath, 'json');
+  } catch (err) {}
+
+  // Get world size
+  let worldSize = '0 MB';
+  try {
+    const worldPath = path.join(serverPath, 'worlds');
+    if (await fs.pathExists(worldPath)) {
+      const size = await getDirectorySize(worldPath);
+      worldSize = formatBytes(size);
+    }
+  } catch (err) {}
+
+  // Get player count with timeout
+  let playerCount = 0;
+  if (info.State.Status === 'running') {
+    try {
+      const playerPromise = (async () => {
+        const exec = await container.exec({
+          Cmd: ['send-command', 'list'],
+          AttachStdout: true,
+          AttachStderr: true
+        });
+        await exec.start();
+        await new Promise(resolve => setTimeout(resolve, 500));
+        const logs = await container.logs({
+          stdout: true,
+          stderr: true,
+          tail: 20
+        });
+        const logText = logs.toString();
+        const lines = logText.trim().split('\n');
+        let lastIndex = -1;
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].includes('players online:')) {
+            lastIndex = i;
+          }
+        }
+        if (lastIndex >= 0) {
+          for (let i = lastIndex + 1; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (line.startsWith('[') || line.startsWith('>') || line.includes('AutoCompaction') || line === '') {
+              break;
+            }
+            if (line) playerCount++;
+          }
+        }
+        return playerCount;
+      })();
+
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Player count timeout')), 5000)
+      );
+
+      playerCount = await Promise.race([playerPromise, timeoutPromise]);
+    } catch (err) {
+      playerCount = 0;
+    }
+  }
+
+  // Get max players from config
+  let maxPlayers = 10;
+  try {
+    const configPath = path.join(serverPath, 'server.properties');
+    const content = await readCachedFile(configPath);
+    const maxPlayersMatch = content.match(/max-players=(\d+)/);
+    if (maxPlayersMatch) {
+      maxPlayers = parseInt(maxPlayersMatch[1]);
+    }
+  } catch (err) {}
+
+  // Convert ports to array format matching listContainers
+  const ports = [];
+  const networkPorts = info.NetworkSettings.Ports || {};
+  for (const [key, bindings] of Object.entries(networkPorts)) {
+    for (const binding of bindings) {
+      ports.push({
+        IP: binding.HostIp || '0.0.0.0',
+        PrivatePort: parseInt(key.split('/')[0]),
+        PublicPort: parseInt(binding.HostPort),
+        Type: key.split('/')[1]
+      });
+    }
+  }
+
+  const serverData = {
+    id: serverId,
+    name: metadata.name || info.Name.replace('/', ''),
+    containerName: metadata.containerName || serverId,
+    version: metadata.version || 'LATEST',
+    status: info.State.Status,
+    players: playerCount,
+    maxPlayers: maxPlayers,
+    uptime: info.State.Running ? formatUptime(info.State.StartedAt) : '0h 0m',
+    memory: formatBytes(info.HostConfig.Memory || 0),
+    cpu: '0%',
+    worldSize: worldSize,
+    ports: ports,
+    webPort: PORT
+  };
+
+  serverCache.set(cacheKey, { data: serverData, timestamp: now });
+  return serverData;
+}
+
+// Invalidate server cache
+function invalidateServerCache(serverId = null) {
+  if (serverId) {
+    serverCache.delete(`server:${serverId}`);
+  } else {
+    serverCache.clear();
+  }
+}
+
+// Batched XUID fetching with concurrency limit
+async function fetchXuidsBatch(players, concurrency = 3) {
+  const results = [];
+  for (let i = 0; i < players.length; i += concurrency) {
+    const batch = players.slice(i, i + concurrency);
+    const batchPromises = batch.map(async (player) => {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 2000); // 2 second timeout
+
+        const response = await fetch(`https://mcprofile.io/api/v1/bedrock/gamertag/${encodeURIComponent(player.name)}`, {
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
+        if (response.ok) {
+          const data = await response.json();
+          return { name: player.name, xuid: data.xuid || null };
+        } else {
+          return { name: player.name, xuid: null };
+        }
+      } catch (err) {
+        return { name: player.name, xuid: null };
+      }
+    });
+
+    const batchResults = await Promise.all(batchPromises);
+    results.push(...batchResults);
+
+    // Small delay between batches to be nice to the API
+    if (i + concurrency < players.length) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+  return results;
+}
 
 const app = express();
 const server = createServer(app);
@@ -150,116 +371,10 @@ app.get('/api/servers', async (req, res) => {
       c.Image.includes(BEDROCK_IMAGE) && c.Labels['server-id']
     );
 
-    const servers = await Promise.all(bedrockServers.map(async c => {
-      const container = docker.getContainer(c.Id);
-      const info = await container.inspect();
-      const serverId = c.Labels['server-id'];
-      const serverPath = getServerPath(serverId);
+    const serverIds = bedrockServers.map(c => c.Labels['server-id']);
+    const servers = await Promise.all(serverIds.map(serverId => getCachedServerInfo(serverId)));
 
-      // Get server name and version from metadata or fallback to label
-      let serverName = c.Labels['server-name'] || serverId;
-      let serverVersion = 'LATEST';
-      try {
-        const metadataPath = path.join(serverPath, 'metadata.json');
-        if (await fs.pathExists(metadataPath)) {
-          const metadata = await fs.readJson(metadataPath);
-          if (metadata.name) {
-            serverName = metadata.name;
-          }
-          if (metadata.version) {
-            serverVersion = metadata.version;
-          }
-        }
-      } catch (err) {
-        // Ignore metadata read errors, use fallback
-      }
-
-      // Get world size
-      let worldSize = '0 MB';
-      try {
-        const worldPath = path.join(serverPath, 'worlds');
-        if (await fs.pathExists(worldPath)) {
-          const size = await getDirectorySize(worldPath);
-          worldSize = formatBytes(size);
-        }
-      } catch (err) {}
-
-      // Get player count
-      let playerCount = 0;
-      if (c.State === 'running') {
-        try {
-          // Send list command
-          const exec = await container.exec({
-            Cmd: ['send-command', 'list'],
-            AttachStdout: true,
-            AttachStderr: true
-          });
-          await exec.start();
-          // Wait a bit
-          await new Promise(resolve => setTimeout(resolve, 500));
-          // Read logs
-          const logs = await container.logs({
-            stdout: true,
-            stderr: true,
-            tail: 20
-          });
-          const logText = logs.toString();
-          const lines = logText.trim().split('\n');
-          // Find the last "players online:" line
-          let lastIndex = -1;
-          for (let i = 0; i < lines.length; i++) {
-            if (lines[i].includes('players online:')) {
-              lastIndex = i;
-            }
-          }
-          if (lastIndex >= 0) {
-            // Count the players
-            for (let i = lastIndex + 1; i < lines.length; i++) {
-              const line = lines[i].trim();
-              if (line.startsWith('[') || line.startsWith('>') || line.includes('AutoCompaction') || line === '') {
-                break;
-              }
-              if (line) {
-                playerCount++;
-              }
-            }
-          }
-        } catch (err) {
-          // Ignore errors
-        }
-      }
-
-      // Get max players from config
-      let maxPlayers = 10;
-      try {
-        const configPath = path.join(serverPath, 'server.properties');
-        if (await fs.pathExists(configPath)) {
-          const content = await fs.readFile(configPath, 'utf8');
-          const maxPlayersMatch = content.match(/max-players=(\d+)/);
-          if (maxPlayersMatch) {
-            maxPlayers = parseInt(maxPlayersMatch[1]);
-          }
-        }
-      } catch (err) {}
-
-      return {
-        id: serverId,
-        name: serverName,
-        containerName: (c.Names && c.Names[0]) ? c.Names[0].replace('/', '') : (metadata.containerName || serverId),
-        version: serverVersion,
-        status: c.State,
-        players: playerCount,
-        maxPlayers: maxPlayers,
-        uptime: info.State.Running ? formatUptime(info.State.StartedAt) : '0h 0m',
-        memory: formatBytes(info.HostConfig.Memory || 0),
-        cpu: '0%',
-        worldSize: worldSize,
-        ports: c.Ports,
-        webPort: PORT
-      };
-    }));
-
-    res.json(servers);
+    res.json(servers.filter(s => s !== null));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -403,6 +518,17 @@ app.post('/api/servers/import', async (req, res) => {
     // Start the new container
     await newContainer.start();
 
+    // Update metadata with actual container name
+    const newContainerInfo = await newContainer.inspect();
+    const actualContainerName = newContainerInfo.Name ? newContainerInfo.Name.replace('/', '') : serverId;
+    const metadataPath3 = path.join(serverPath, 'metadata.json');
+    if (await fs.pathExists(metadataPath3)) {
+      const metadata = await fs.readJson(metadataPath3);
+      metadata.containerName = actualContainerName;
+      metadata.updatedAt = new Date().toISOString();
+      await fs.writeJson(metadataPath3, metadata, { spaces: 2 });
+    }
+
     // Broadcast server update
     setTimeout(() => broadcastServerUpdate(serverId), 2000);
 
@@ -488,7 +614,19 @@ app.post('/api/servers', async (req, res) => {
 
     await container.start();
 
-    // Broadcast server update
+    // Update metadata with actual container name
+    const containerInfo = await container.inspect();
+    const actualContainerName = containerInfo.Name ? containerInfo.Name.replace('/', '') : serverId;
+    const metadataPath2 = path.join(serverPath, 'metadata.json');
+    if (await fs.pathExists(metadataPath2)) {
+      const metadata = await fs.readJson(metadataPath2);
+      metadata.containerName = actualContainerName;
+      metadata.updatedAt = new Date().toISOString();
+      await fs.writeJson(metadataPath2, metadata, { spaces: 2 });
+    }
+
+    // Invalidate cache and broadcast server update
+    invalidateServerCache();
     setTimeout(() => broadcastServerUpdate(serverId), 2000); // Wait for container to fully start
 
     res.json({
@@ -524,9 +662,11 @@ app.post('/api/servers/:id/start', async (req, res) => {
         metadata.containerName = containerName;
         metadata.updatedAt = new Date().toISOString();
         await fs.writeJson(metadataPath, metadata, { spaces: 2 });
+        invalidateFileCache(metadataPath);
       }
 
-      // Broadcast server update
+      // Invalidate cache and broadcast server update
+      invalidateServerCache(req.params.id);
       setTimeout(() => broadcastServerUpdate(req.params.id), 2000);
       res.json({ message: 'Server started' });
     } catch (startErr) {
@@ -752,6 +892,17 @@ app.post('/api/servers/:id/rename', async (req, res) => {
       await newContainer.start();
     }
 
+    // Update metadata with actual container name
+    const newContainerInfo = await newContainer.inspect();
+    const actualContainerName = newContainerInfo.Name ? newContainerInfo.Name.replace('/', '') : serverId;
+    const metadataPath4 = path.join(serverPath, 'metadata.json');
+    if (await fs.pathExists(metadataPath4)) {
+      const metadata = await fs.readJson(metadataPath4);
+      metadata.containerName = actualContainerName;
+      metadata.updatedAt = new Date().toISOString();
+      await fs.writeJson(metadataPath4, metadata, { spaces: 2 });
+    }
+
     // Broadcast server update
     setTimeout(() => broadcastServerUpdate(serverId), wasRunning ? 3000 : 1000);
 
@@ -846,6 +997,17 @@ app.post('/api/servers/:id/version', async (req, res) => {
     // Start container if it was running before
     if (wasRunning) {
       await newContainer.start();
+    }
+
+    // Update metadata with actual container name
+    const newContainerInfo = await newContainer.inspect();
+    const actualContainerName = newContainerInfo.Name ? newContainerInfo.Name.replace('/', '') : serverId;
+    const metadataPath5 = path.join(serverPath, 'metadata.json');
+    if (await fs.pathExists(metadataPath5)) {
+      const metadata = await fs.readJson(metadataPath5);
+      metadata.containerName = actualContainerName;
+      metadata.updatedAt = new Date().toISOString();
+      await fs.writeJson(metadataPath5, metadata, { spaces: 2 });
     }
 
     // Broadcast server update
@@ -956,6 +1118,17 @@ app.put('/api/servers/:id/memory', async (req, res) => {
     // Start container if it was running before
     if (wasRunning) {
       await newContainer.start();
+    }
+
+    // Update metadata with actual container name
+    const newContainerInfo = await newContainer.inspect();
+    const actualContainerName = newContainerInfo.Name ? newContainerInfo.Name.replace('/', '') : serverId;
+    const metadataPath6 = path.join(serverPath, 'metadata.json');
+    if (await fs.pathExists(metadataPath6)) {
+      const metadata = await fs.readJson(metadataPath6);
+      metadata.containerName = actualContainerName;
+      metadata.updatedAt = new Date().toISOString();
+      await fs.writeJson(metadataPath6, metadata, { spaces: 2 });
     }
 
     // Broadcast server update
@@ -1137,7 +1310,7 @@ app.get('/api/servers/:id/players', async (req, res) => {
         }
         if (line) {
           // Split by comma and clean each name
-          const names = line.split(',').map(n => n.replace(/[^\x20-\x7E]/g, '').trim()).filter(n => n);
+          const names = line.split(',').map(n => n.replace(/[^\x20-\x7E]/g, '').replace(/"/g, '').trim()).filter(n => n);
           players.push(...names.map(name => ({ name })));
         }
       }
@@ -1605,12 +1778,8 @@ app.post('/api/servers/:id/unzip', express.json(), async (req, res) => {
     await fs.ensureDir(fullExtractPath);
 
     // Extract the zip file
-    await new Promise((resolve, reject) => {
-      fs.createReadStream(fullZipPath)
-        .pipe(unzipper.Extract({ path: fullExtractPath }))
-        .on('close', resolve)
-        .on('error', reject);
-    });
+    const zip = new AdmZip(fullZipPath);
+    zip.extractAllTo(fullExtractPath, true);
 
     res.json({ 
       message: 'File extracted successfully',
@@ -1643,10 +1812,8 @@ app.post('/api/servers/:id/backups/:backupId/restore', async (req, res) => {
     }
     
     // Extract backup
-    const unzipper = require('unzipper');
-    await fs.createReadStream(backupFile)
-      .pipe(unzipper.Extract({ path: serverPath }))
-      .promise();
+    const zip = new AdmZip(backupFile);
+    zip.extractAllTo(serverPath, true);
     
     // Restart server
     if (container) {
@@ -1838,12 +2005,13 @@ const getAddonPaths = (serverId) => {
 // Helper: Extract manifest from addon
 async function extractManifest(addonPath) {
   try {
-    const directory = await unzipper.Open.file(addonPath);
-    const manifestFile = directory.files.find(f => f.path === 'manifest.json' || f.path.endsWith('/manifest.json'));
-    
-    if (manifestFile) {
-      const content = await manifestFile.buffer();
-      return JSON.parse(content.toString());
+    const zip = new AdmZip(addonPath);
+    const entries = zip.getEntries();
+    const manifestEntry = entries.find(e => e.entryName === 'manifest.json' || e.entryName.endsWith('/manifest.json'));
+
+    if (manifestEntry) {
+      const content = manifestEntry.getData().toString();
+      return JSON.parse(content);
     }
     return null;
   } catch (err) {
@@ -1981,7 +2149,8 @@ app.get('/api/servers/:id/addons', async (req, res) => {
         version: manifest?.header?.version || null,
         description: manifest?.header?.description || '',
         size: stats.isDirectory() ? await getDirectorySize(packPath) : stats.size,
-        modified: stats.mtime
+        modified: stats.mtime,
+        manifest: manifest
       };
     }));
 
@@ -2013,9 +2182,58 @@ app.get('/api/servers/:id/addons', async (req, res) => {
         version: manifest?.header?.version || null,
         description: manifest?.header?.description || '',
         size: stats.isDirectory() ? await getDirectorySize(packPath) : stats.size,
-        modified: stats.mtime
+        modified: stats.mtime,
+        manifest: manifest
       };
     }));
+
+    // Create UUID map for dependency linking
+    const uuidMap = new Map();
+    addonMap.forEach((addon, name) => {
+      if (addon.behaviorPack && addon.behaviorPack.uuid) {
+        uuidMap.set(addon.behaviorPack.uuid, { type: 'behavior', name, addon });
+      }
+      if (addon.resourcePack && addon.resourcePack.uuid) {
+        uuidMap.set(addon.resourcePack.uuid, { type: 'resource', name, addon });
+      }
+    });
+
+    // Link addons by dependencies
+    // Process behavior packs depending on resource packs
+    addonMap.forEach((addon, name) => {
+      if (addon.behaviorPack && addon.behaviorPack.manifest && addon.behaviorPack.manifest.dependencies) {
+        for (const dep of addon.behaviorPack.manifest.dependencies) {
+          if (uuidMap.has(dep.uuid)) {
+            const depPack = uuidMap.get(dep.uuid);
+            if (depPack.type === 'resource' && !addon.resourcePack) {
+              addon.resourcePack = depPack.addon.resourcePack;
+              // Remove the separate entry if names differ
+              if (addonMap.has(depPack.name) && depPack.name !== name) {
+                addonMap.delete(depPack.name);
+              }
+            }
+          }
+        }
+      }
+    });
+
+    // Process resource packs depending on behavior packs
+    addonMap.forEach((addon, name) => {
+      if (addon.resourcePack && addon.resourcePack.manifest && addon.resourcePack.manifest.dependencies) {
+        for (const dep of addon.resourcePack.manifest.dependencies) {
+          if (uuidMap.has(dep.uuid)) {
+            const depPack = uuidMap.get(dep.uuid);
+            if (depPack.type === 'behavior' && !addon.behaviorPack) {
+              addon.behaviorPack = depPack.addon.behaviorPack;
+              // Remove the separate entry if names differ
+              if (addonMap.has(depPack.name) && depPack.name !== name) {
+                addonMap.delete(depPack.name);
+              }
+            }
+          }
+        }
+      }
+    });
 
     // Convert map to array
     const addons = Array.from(addonMap.values());
@@ -2114,9 +2332,8 @@ app.post('/api/servers/:id/addons/upload', addonUpload.single('addon'), async (r
       const tempExtractPath = path.join('./temp', `extract-${Date.now()}`);
       await fs.ensureDir(tempExtractPath);
 
-      await fs.createReadStream(req.file.path)
-        .pipe(unzipper.Extract({ path: tempExtractPath }))
-        .promise();
+      const zip = new AdmZip(req.file.path);
+      zip.extractAllTo(tempExtractPath, true);
 
       io.emit('upload-progress', {
         serverId,
@@ -2184,9 +2401,8 @@ app.post('/api/servers/:id/addons/upload', addonUpload.single('addon'), async (r
       const tempExtractPath = path.join('./temp', `extract-${Date.now()}`);
       await fs.ensureDir(tempExtractPath);
 
-      await fs.createReadStream(req.file.path)
-        .pipe(unzipper.Extract({ path: tempExtractPath }))
-        .promise();
+      const zip = new AdmZip(req.file.path);
+      zip.extractAllTo(tempExtractPath, true);
 
       const extractedItems = await fs.readdir(tempExtractPath);
       const manifestPath = path.join(tempExtractPath, 'manifest.json');
@@ -2223,9 +2439,8 @@ app.post('/api/servers/:id/addons/upload', addonUpload.single('addon'), async (r
     } else if (ext === '.mcworld' || ext === '.mctemplate') {
       const worldName = path.basename(originalName, ext);
       const extractPath = path.join(targetDir, worldName);
-      await fs.createReadStream(req.file.path)
-        .pipe(unzipper.Extract({ path: extractPath }))
-        .promise();
+      const zip = new AdmZip(req.file.path);
+      zip.extractAllTo(extractPath, true);
     }
 
     io.emit('upload-progress', {
@@ -2677,49 +2892,10 @@ io.on('connection', (socket) => {
         c.Image.includes(BEDROCK_IMAGE) && c.Labels['server-id']
       );
 
-      const servers = await Promise.all(bedrockServers.map(async c => {
-        const container = docker.getContainer(c.Id);
-        const info = await container.inspect();
-        const serverId = c.Labels['server-id'];
-        const serverPath = getServerPath(serverId);
+      const serverIds = bedrockServers.map(c => c.Labels['server-id']);
+      const servers = await Promise.all(serverIds.map(id => getCachedServerInfo(id)));
 
-        let serverName = c.Labels['server-name'] || serverId;
-        let serverVersion = 'LATEST';
-        try {
-          const metadataPath = path.join(serverPath, 'metadata.json');
-          if (await fs.pathExists(metadataPath)) {
-            const metadata = await fs.readJson(metadataPath);
-            if (metadata.name) serverName = metadata.name;
-            if (metadata.version) serverVersion = metadata.version;
-          }
-        } catch (err) {}
-
-        let worldSize = '0 MB';
-        try {
-          const worldPath = path.join(serverPath, 'worlds');
-          if (await fs.pathExists(worldPath)) {
-            const size = await getDirectorySize(worldPath);
-            worldSize = formatBytes(size);
-          }
-        } catch (err) {}
-
-        return {
-          id: serverId,
-          name: serverName,
-          version: serverVersion,
-          status: c.State,
-          players: 0, // Will be updated separately
-          maxPlayers: 10,
-          uptime: info.State.Running ? formatUptime(info.State.StartedAt) : '0h 0m',
-          memory: formatBytes(info.HostConfig.Memory || 0),
-          cpu: '0%',
-          worldSize: worldSize,
-          ports: c.Ports,
-          webPort: PORT
-        };
-      }));
-
-      socket.emit('servers-update', servers);
+      socket.emit('servers-update', servers.filter(s => s !== null));
     } catch (err) {
       console.error('Error sending initial data:', err);
     }
@@ -2730,105 +2906,18 @@ io.on('connection', (socket) => {
   });
 });
 
-// Helper function to broadcast server updates
-async function broadcastServerUpdate(serverId = null) {
+// Debounced broadcast function
+const debouncedBroadcastServerUpdate = debounce(async (serverId = null) => {
   try {
     const containers = await docker.listContainers({ all: true });
     const bedrockServers = containers.filter(c =>
       c.Image.includes(BEDROCK_IMAGE) && c.Labels['server-id']
     );
 
-    const servers = await Promise.all(bedrockServers.map(async c => {
-      const container = docker.getContainer(c.Id);
-      const info = await container.inspect();
-      const currentServerId = c.Labels['server-id'];
-      const serverPath = getServerPath(currentServerId);
+    const serverIds = bedrockServers.map(c => c.Labels['server-id']);
+    const servers = await Promise.all(serverIds.map(id => getCachedServerInfo(id)));
 
-      let serverName = c.Labels['server-name'] || currentServerId;
-      let serverVersion = 'LATEST';
-      try {
-        const metadataPath = path.join(serverPath, 'metadata.json');
-        if (await fs.pathExists(metadataPath)) {
-          const metadata = await fs.readJson(metadataPath);
-          if (metadata.name) serverName = metadata.name;
-          if (metadata.version) serverVersion = metadata.version;
-        }
-      } catch (err) {}
-
-      let worldSize = '0 MB';
-      try {
-        const worldPath = path.join(serverPath, 'worlds');
-        if (await fs.pathExists(worldPath)) {
-          const size = await getDirectorySize(worldPath);
-          worldSize = formatBytes(size);
-        }
-      } catch (err) {}
-
-      let playerCount = 0;
-      if (c.State === 'running') {
-        try {
-          const exec = await container.exec({
-            Cmd: ['send-command', 'list'],
-            AttachStdout: true,
-            AttachStderr: true
-          });
-          await exec.start();
-          await new Promise(resolve => setTimeout(resolve, 500));
-          const logs = await container.logs({
-            stdout: true,
-            stderr: true,
-            tail: 20
-          });
-          const logText = logs.toString();
-          const lines = logText.trim().split('\n');
-          let lastIndex = -1;
-          for (let i = 0; i < lines.length; i++) {
-            if (lines[i].includes('players online:')) {
-              lastIndex = i;
-            }
-          }
-          if (lastIndex >= 0) {
-            for (let i = lastIndex + 1; i < lines.length; i++) {
-              const line = lines[i].trim();
-              if (line.startsWith('[') || line.startsWith('>') || line.includes('AutoCompaction') || line === '') {
-                break;
-              }
-              if (line) playerCount++;
-            }
-          }
-        } catch (err) {}
-      }
-
-      let maxPlayers = 10;
-      try {
-        const configPath = path.join(serverPath, 'server.properties');
-        if (await fs.pathExists(configPath)) {
-          const content = await fs.readFile(configPath, 'utf8');
-          const maxPlayersMatch = content.match(/max-players=(\d+)/);
-          if (maxPlayersMatch) {
-            maxPlayers = parseInt(maxPlayersMatch[1]);
-          }
-        }
-      } catch (err) {}
-
-      return {
-        id: currentServerId,
-        name: serverName,
-        containerName: (c.Names && c.Names[0]) ? c.Names[0].replace('/', '') : (metadata.containerName || currentServerId),
-        version: serverVersion,
-        status: c.State,
-        players: playerCount,
-        maxPlayers: maxPlayers,
-        uptime: info.State.Running ? formatUptime(info.State.StartedAt) : '0h 0m',
-        memory: formatBytes(info.HostConfig.Memory || 0),
-        cpu: '0%',
-        worldSize: worldSize,
-        ports: c.Ports,
-        webPort: PORT
-      };
-    }));
-
-    io.emit('servers-update', servers);
+    io.emit('servers-update', servers.filter(s => s !== null));
 
     // If specific server updated, also emit detailed data
     if (serverId) {
@@ -2837,6 +2926,11 @@ async function broadcastServerUpdate(serverId = null) {
   } catch (err) {
     console.error('Error broadcasting server update:', err);
   }
+}, 2000); // 2 second debounce
+
+// Helper function to broadcast server updates
+async function broadcastServerUpdate(serverId = null) {
+  debouncedBroadcastServerUpdate(serverId);
 }
 
 // Helper function to broadcast server details with timeout
@@ -2893,7 +2987,7 @@ async function broadcastServerDetails(serverId) {
                 break;
               }
               if (line) {
-                const names = line.split(',').map(n => n.replace(/[^\x20-\x7E]/g, '').trim()).filter(n => n);
+                const names = line.split(',').map(n => n.replace(/[^\x20-\x7E]/g, '').replace(/"/g, '').trim()).filter(n => n);
                 players_temp.push(...names.map(name => ({ name })));
               }
             }
@@ -2908,30 +3002,13 @@ async function broadcastServerDetails(serverId) {
             }
           } catch (err) {}
 
-          const uncachedPlayers = players_temp.filter(p => !playerCache[p.name]).slice(0, 3);
+          const uncachedPlayers = players_temp.filter(p => !playerCache[p.name]);
 
           if (uncachedPlayers.length > 0) {
-            for (const player of uncachedPlayers) {
-              try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 2000);
+            const xuidResults = await fetchXuidsBatch(uncachedPlayers);
 
-                const response = await fetch(`https://mcprofile.io/api/v1/bedrock/gamertag/${encodeURIComponent(player.name)}`, {
-                  signal: controller.signal
-                });
-                clearTimeout(timeoutId);
-
-                if (response.ok) {
-                  const data = await response.json();
-                  player.xuid = data.xuid || null;
-                  playerCache[player.name] = player.xuid;
-                } else {
-                  player.xuid = null;
-                }
-              } catch (err) {
-                player.xuid = null;
-              }
-              await new Promise(resolve => setTimeout(resolve, 50));
+            for (const result of xuidResults) {
+              playerCache[result.name] = result.xuid;
             }
 
             try {

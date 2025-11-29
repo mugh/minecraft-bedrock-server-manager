@@ -51,15 +51,6 @@ The aplication will deploy a minecraft bedrock server using docker itzg/docker-m
 - Each addon shows type indicators: `BP` (Behavior Pack), `RP` (Resource Pack), or `BP + RP` (both types)
 - Enable/disable and delete operations work on both pack types simultaneously
 
-**For Existing Containers**
-To ensure existing addons are properly detected and grouped together, rename addon folders in both `behavior_packs/` and `resource_packs/` directories to use the same base name. For example:
-```
-behavior_packs/MyAddon/
-resource_packs/MyAddon/
-```
-This will allow the system to recognize them as a single combined addon instead of separate entries.
-
-
 
 ### WebSocket Real-time Features
 This application uses WebSocket for real-time updates, providing instant UI synchronization across multiple browser tabs without manual refresh.
