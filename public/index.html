@@ -950,6 +950,10 @@
                             <input id="swal-server-name" type="text" placeholder="My Minecraft Server" class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500 text-white">
                         </div>
                         <div class="mb-4">
+                            <label class="block text-sm font-medium text-gray-300 mb-2">Server Port (Optional)</label>
+                            <input id="swal-server-port" type="number" placeholder="Default: 19132" class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500 text-white">
+                        </div>
+                        <div class="mb-4">
                             <label class="block text-sm font-medium text-gray-300 mb-2">Minecraft Version</label>
                             <div class="space-y-2">
                                 <div class="flex gap-2">
@@ -993,6 +997,7 @@
                 },
                 preConfirm: () => {
                     const name = document.getElementById('swal-server-name').value.trim();
+                    const port = document.getElementById('swal-server-port').value.trim();
                     const versionType = document.querySelector('input[name="version-type"]:checked').value;
                     let version;
 
@@ -1010,19 +1015,19 @@
                         Swal.showValidationMessage('Server name is required!');
                         return false;
                     }
-                    return { name, version };
+                    return { name, port: port ? parseInt(port) : undefined, version };
                 }
             });
 
             if (!formValues) return;
-            const { name, version } = formValues;
+            const { name, port, version } = formValues;
 
             try {
                 showLoading();
                 await fetch(`${API_BASE}/servers`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name, version })
+                    body: JSON.stringify({ name, port, version })
                 });
                 await fetchServers();
                 hideLoading();
@@ -2388,6 +2393,7 @@
                                             <span class="px-2 py-0.5 text-xs bg-blue-600 rounded-lg">v${currentServer.version || 'LATEST'}</span>
                                             <button onclick="editServerVersion()" class="px-2 py-0.5 text-xs bg-gray-600 hover:bg-gray-500 rounded" title="Edit Version">✏️</button>
                                             <button onclick="editServerMemory()" class="px-2 py-0.5 text-xs bg-purple-600 hover:bg-purple-500 rounded" title="Edit Memory">🧠</button>
+                                            <button onclick="changeServerPort()" class="px-2 py-0.5 text-xs bg-teal-600 hover:bg-teal-500 rounded" title="Change Port">🔌</button>
                                         </div>
                                         <div class="text-xs text-gray-400 mt-0.5 truncate">
                                             ${currentServer.status} • ${currentServer.worldSize}
@@ -2435,6 +2441,60 @@
                     </div>
                 </div>
             `;
+        }
+
+        async function changeServerPort() {
+            const currentServer = state.servers.find(s => s.id === state.selectedServer);
+            if (!currentServer) return;
+
+            const { value: port } = await Swal.fire({
+                title: 'Change Server Port',
+                input: 'number',
+                inputLabel: 'Enter new port number',
+                inputValue: currentServer.ports?.find(p => p.PrivatePort === 19132)?.PublicPort || 19132,
+                showCancelButton: true,
+                confirmButtonColor: '#10b981',
+                cancelButtonColor: '#6b7280',
+                inputValidator: (value) => {
+                    if (!value || value < 1024 || value > 65535) {
+                        return 'Please enter a valid port number (1024-65535)';
+                    }
+                }
+            });
+
+            if (!port) return;
+
+            try {
+                showLoading();
+                const response = await fetch(`${API_BASE}/servers/${state.selectedServer}/port`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ port: parseInt(port) })
+                });
+
+                if (response.ok) {
+                    await fetchServers();
+                    hideLoading();
+                    Swal.fire({
+                        title: 'Success',
+                        text: 'Server port updated successfully! The server needs to be restarted for the change to take effect.',
+                        icon: 'success',
+                        confirmButtonColor: '#10b981'
+                    });
+                } else {
+                    const result = await response.json();
+                    hideLoading();
+                    throw new Error(result.error || 'Failed to update port');
+                }
+            } catch (err) {
+                hideLoading();
+                Swal.fire({
+                    title: 'Error',
+                    text: 'Failed to update server port: ' + err.message,
+                    icon: 'error',
+                    confirmButtonColor: '#10b981'
+                });
+            }
         }
 
         function getConfigInputHTML(key, value) {

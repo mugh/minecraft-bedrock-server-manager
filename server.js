@@ -384,7 +384,7 @@ app.get('/api/servers', async (req, res) => {
 // POST /api/servers/import - Import existing server
 app.post('/api/servers/import', async (req, res) => {
   try {
-    const { containerName } = req.body;
+    const { containerName, port } = req.body;
     if (!containerName || !containerName.trim()) {
       return res.status(400).json({ error: 'Container name is required' });
     }
@@ -471,8 +471,20 @@ app.post('/api/servers/import', async (req, res) => {
     metadata.importedFrom = trimmedName;
     await fs.writeJson(metadataPath, metadata, { spaces: 2 });
 
-    // Find available port
-    const gamePort = await findAvailablePort(19132);
+    // Find available port or use requested one
+    let gamePort;
+    if (port) {
+      const requestedPort = parseInt(port);
+      if (isNaN(requestedPort) || requestedPort < 1 || requestedPort > 65535) {
+        return res.status(400).json({ error: 'Invalid port number' });
+      }
+      if (!(await isPortAvailable(requestedPort))) {
+        return res.status(400).json({ error: `Port ${requestedPort} is already in use` });
+      }
+      gamePort = requestedPort;
+    } else {
+      gamePort = await findAvailablePort(19132);
+    }
 
     // Pull the Docker image if not available
     try {
@@ -548,7 +560,7 @@ app.post('/api/servers/import', async (req, res) => {
 // POST /api/servers - Create new server
 app.post('/api/servers', async (req, res) => {
   try {
-    const { name, version = 'LATEST' } = req.body;
+    const { name, version = 'LATEST', port } = req.body;
     const serverId = `bedrock-${Date.now()}`;
     const serverPath = getServerPath(serverId);
     const hostDataPath = await getHostDataPath();
@@ -568,8 +580,20 @@ app.post('/api/servers', async (req, res) => {
     };
     await fs.writeJson(metadataPath, metadata, { spaces: 2 });
 
-    // Find available port
-    const gamePort = await findAvailablePort(19132);
+    // Find available port or use requested one
+    let gamePort;
+    if (port) {
+      const requestedPort = parseInt(port);
+      if (isNaN(requestedPort) || requestedPort < 1 || requestedPort > 65535) {
+        return res.status(400).json({ error: 'Invalid port number' });
+      }
+      if (!(await isPortAvailable(requestedPort))) {
+        return res.status(400).json({ error: `Port ${requestedPort} is already in use` });
+      }
+      gamePort = requestedPort;
+    } else {
+      gamePort = await findAvailablePort(19132);
+    }
 
     // Pull the Docker image if not available
     try {
@@ -1142,6 +1166,96 @@ app.put('/api/servers/:id/memory', async (req, res) => {
     });
   } catch (err) {
     console.error('Error updating server memory:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/servers/:id/port - Update server port
+app.put('/api/servers/:id/port', async (req, res) => {
+  try {
+    const { port } = req.body;
+    const requestedPort = parseInt(port);
+
+    if (!port || isNaN(requestedPort) || requestedPort < 1 || requestedPort > 65535) {
+      return res.status(400).json({ error: 'Valid port number is required' });
+    }
+
+    if (!(await isPortAvailable(requestedPort))) {
+      return res.status(400).json({ error: `Port ${requestedPort} is already in use` });
+    }
+
+    const serverId = req.params.id;
+    const serverPath = getServerPath(serverId);
+    const hostDataPath = await getHostDataPath();
+    const hostServerPath = path.join(hostDataPath, serverId);
+
+    // Get current container info
+    const container = await getContainer(serverId);
+    if (!container) {
+      return res.status(404).json({ error: 'Container not found' });
+    }
+
+    const containerInfo = await container.inspect();
+    const wasRunning = containerInfo.State.Running;
+
+    // Read metadata to preserve settings
+    const metadataPath = path.join(serverPath, 'metadata.json');
+    let metadata = {};
+    if (await fs.pathExists(metadataPath)) {
+      metadata = await fs.readJson(metadataPath);
+    }
+
+    // Stop and remove old container
+    if (wasRunning) {
+      await container.stop();
+    }
+    await container.remove();
+
+    // Create new container with NEW PORT
+    const newContainer = await docker.createContainer({
+      Image: BEDROCK_IMAGE,
+      name: serverId,
+      Labels: {
+        'server-id': serverId,
+        'server-name': metadata.name || serverId
+      },
+      Env: [
+        'EULA=TRUE',
+        'VERSION=' + (metadata.version || 'LATEST'),
+        'SERVER_NAME=' + (metadata.name || serverId)
+      ],
+      HostConfig: {
+        Binds: [`${hostServerPath}:/data`],
+        PortBindings: {
+          '19132/udp': [{ HostPort: requestedPort.toString() }]
+        },
+        RestartPolicy: {
+          Name: 'unless-stopped'
+        },
+        Memory: metadata.memory || 2 * 1024 * 1024 * 1024
+      }
+    });
+
+    // Start if it was running
+    if (wasRunning) {
+      await newContainer.start();
+    }
+
+    // Update metadata (optional, just to refresh timestamp)
+    metadata.updatedAt = new Date().toISOString();
+    metadata.containerName = (await newContainer.inspect()).Name.replace('/', '');
+    await fs.writeJson(metadataPath, metadata, { spaces: 2 });
+
+    // Broadcast update
+    setTimeout(() => broadcastServerUpdate(serverId), wasRunning ? 3000 : 1000);
+
+    res.json({
+      message: 'Server port updated successfully',
+      gamePort: requestedPort,
+      restarted: wasRunning
+    });
+  } catch (err) {
+    console.error('Error updating server port:', err);
     res.status(500).json({ error: err.message });
   }
 });

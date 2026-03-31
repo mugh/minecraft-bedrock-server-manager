@@ -1,0 +1,22 @@
+services:
+  server-manager:
+    # CHANGE: Use 'build: .' to build the Dockerfile in the current directory
+    build: . 
+    # Optional: You can still tag the image if you want
+    image: my-custom-bds-manager
+    container_name: bds-manager
+    ports:
+      - "3001:3001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - minecraft-data:/app/minecraft-data
+      # Mirroring your existing server paths exactly:
+      - /opt/minecraft/data:/opt/minecraft/data
+      - /opt/minecraft2/data:/opt/minecraft2/data
+    environment:
+      - PORT=3001
+      - LOGIN_PASSWORD=minecraft123 # Change this!
+    restart: unless-stopped
+
+volumes:
+  minecraft-data:
