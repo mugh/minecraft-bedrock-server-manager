@@ -1,0 +1,7 @@
+node_modules/
+logs/
+temp/
+test-data/
+public/socket.io.js
+public/output.css
+public/sweetalert2/

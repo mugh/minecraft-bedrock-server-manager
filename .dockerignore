@@ -1,0 +1,7 @@
+node_modules/
+logs/
+temp/
+test-data/
+.git/
+.gitignore
+Dockerfile
