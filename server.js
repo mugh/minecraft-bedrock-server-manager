@@ -374,8 +374,10 @@ app.get('/api/servers', async (req, res) => {
   try {
     const containers = await docker.listContainers({ all: true });
     const bedrockServers = containers.filter(c => {
-      // Support itzg/minecraft-bedrock-server and itzg/minecraft-bedrock (with any tag)
-      return c.Image.includes("itzg/minecraft-bedrock-server") || c.Image.includes("itzg/minecraft-bedrock");
+      const imageName = (c.Image || "").toLowerCase();
+      // Broad check to find any Bedrock/Minecraft related container
+      const isBedrock = imageName.includes("bedrock") || imageName.includes("minecraft") || imageName.includes("itzg/");
+      return isBedrock;
     });
 
     const serverIds = bedrockServers.map(c => (c.Labels && c.Labels['server-id']) || c.Id);
@@ -406,20 +408,23 @@ app.post('/api/servers/import', async (req, res) => {
       return res.status(404).json({ error: 'Container not found' });
     }
 
-    // Check if it's the correct image
-    const isBedrockImage = containerInfo.Image.includes("itzg/minecraft-bedrock-server") || containerInfo.Image.includes("itzg/minecraft-bedrock");
+    console.log(`Importing container: ${trimmedName} - Image: ${containerInfo.Image}`);
+    const imageName = (containerInfo.Image || "").toLowerCase();
+    const isBedrockImage = imageName.includes("bedrock") || imageName.includes("minecraft") || imageName.includes("itzg/");
     if (!isBedrockImage) {
-      return res.status(400).json({ error: 'Container is not a Minecraft Bedrock server' });
+      return res.status(400).json({ error: 'Container is not recognized as a Minecraft Bedrock server' });
     }
 
     // Inspect the container
     const container = docker.getContainer(containerInfo.Id);
     const details = await container.inspect();
 
-    // Find the data mount
-    const dataMount = details.Mounts?.find(m => m.Destination === '/data');
+        // Find the data mount
+    // Older containers might use /data, others might use different paths
+    const dataMount = details.Mounts?.find(m => m.Destination === '/data' || m.Destination === '/app/minecraft-data');
     if (!dataMount) {
-      return res.status(400).json({ error: 'Container does not have a /data mount' });
+      console.log('Available mounts:', JSON.stringify(details.Mounts, null, 2));
+      return res.status(400).json({ error: 'Container does not have a recognized data mount (/data or /app/minecraft-data)' });
     }
 
     const sourceDataPath = dataMount.Source;
@@ -3010,9 +3015,10 @@ io.on('connection', (socket) => {
   socket.on('request-initial-data', async () => {
     try {
       const containers = await docker.listContainers({ all: true });
-      const bedrockServers = containers.filter(c =>
-        c.Image.includes("itzg/minecraft-bedrock-server") || c.Image.includes("itzg/minecraft-bedrock")
-      );
+      const bedrockServers = containers.filter(c => {
+        const imageName = (c.Image || "").toLowerCase();
+        return imageName.includes("bedrock") || imageName.includes("minecraft") || imageName.includes("itzg/");
+      });
 
       const serverIds = bedrockServers.map(c => (c.Labels && c.Labels['server-id']) || c.Id);
       const servers = await Promise.all(serverIds.map(id => getCachedServerInfo(id)));
@@ -3032,9 +3038,10 @@ io.on('connection', (socket) => {
 const debouncedBroadcastServerUpdate = debounce(async (serverId = null) => {
   try {
     const containers = await docker.listContainers({ all: true });
-    const bedrockServers = containers.filter(c =>
-      c.Image.includes("itzg/minecraft-bedrock-server") || c.Image.includes("itzg/minecraft-bedrock")
-    );
+    const bedrockServers = containers.filter(c => {
+        const imageName = (c.Image || "").toLowerCase();
+        return imageName.includes("bedrock") || imageName.includes("minecraft") || imageName.includes("itzg/");
+      });
 
     const serverIds = bedrockServers.map(c => (c.Labels && c.Labels['server-id']) || c.Id);
     const servers = await Promise.all(serverIds.map(id => getCachedServerInfo(id)));
