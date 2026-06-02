@@ -3,13 +3,11 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-    const container = docker.getContainer(containerInfo.Id);
 const Docker = require('dockerode');
-    const bedrockServers = containers.filter(c => {
-      const isBedrock = c.Image.includes("bedrock") || c.Image.includes(BEDROCK_IMAGE);
-      if (isBedrock) console.log(`Found Bedrock candidate: ${c.Names ? c.Names[0] : c.Id} - Image: ${c.Image}`);
-      return isBedrock;
-    });
+const fs = require('fs-extra');
+const path = require('path');
+const archiver = require('archiver');
+const AdmZip = require('adm-zip');
 const fsPromises = require('fs').promises;
 const multer = require('multer');
 const { createServer } = require('http');
@@ -362,7 +360,7 @@ const getHostDataPath = async () => {
 const getContainer = async (serverId) => {
   const containers = await docker.listContainers({ all: true });
   const container = containers.find(c =>
-    c.Labels["server-id"] === serverId ||
+    (c.Labels && c.Labels['server-id'] === serverId) ||
     c.Id === serverId ||
     c.Id.startsWith(serverId) ||
     (c.Names && c.Names.includes("/" + serverId))
@@ -375,15 +373,12 @@ const getContainer = async (serverId) => {
 app.get('/api/servers', async (req, res) => {
   try {
     const containers = await docker.listContainers({ all: true });
-    console.log(`Found ${containers.length} total containers`);
     const bedrockServers = containers.filter(c => {
-      // Check for the specific image name or tags
-      const isBedrock = c.Image.includes("itzg/minecraft-bedrock-server") || c.Image.includes("itzg/minecraft-bedrock");
-      if (isBedrock) console.log(`Found Bedrock candidate: ${c.Names ? c.Names[0] : c.Id} - Image: ${c.Image}`);
-      return isBedrock;
+      // Support itzg/minecraft-bedrock-server and itzg/minecraft-bedrock (with any tag)
+      return c.Image.includes("itzg/minecraft-bedrock-server") || c.Image.includes("itzg/minecraft-bedrock");
     });
 
-    const serverIds = bedrockServers.map(c => (c.Labels && c.Labels["server-id"]) || c.Id);
+    const serverIds = bedrockServers.map(c => (c.Labels && c.Labels['server-id']) || c.Id);
     const servers = await Promise.all(serverIds.map(serverId => getCachedServerInfo(serverId)));
 
     res.json(servers.filter(s => s !== null));
@@ -411,7 +406,7 @@ app.post('/api/servers/import', async (req, res) => {
       return res.status(404).json({ error: 'Container not found' });
     }
 
-    console.log(`Importing container: ${trimmedName} - Image: ${containerInfo.Image}`);
+    // Check if it's the correct image
     const isBedrockImage = containerInfo.Image.includes("itzg/minecraft-bedrock-server") || containerInfo.Image.includes("itzg/minecraft-bedrock");
     if (!isBedrockImage) {
       return res.status(400).json({ error: 'Container is not a Minecraft Bedrock server' });
@@ -2055,7 +2050,7 @@ async function findAvailablePort(startPort) {
   const allocatedPorts = new Set();
 
   containers.forEach(c => {
-     (c.Ports || []).forEach(p => {
+    (c.Ports || []).forEach(p => {
       if (p.PublicPort) {
         allocatedPorts.add(p.PublicPort);
       }
@@ -3019,7 +3014,7 @@ io.on('connection', (socket) => {
         c.Image.includes("itzg/minecraft-bedrock-server") || c.Image.includes("itzg/minecraft-bedrock")
       );
 
-      const serverIds = bedrockServers.map(c => (c.Labels && c.Labels["server-id"]) || c.Id);
+      const serverIds = bedrockServers.map(c => (c.Labels && c.Labels['server-id']) || c.Id);
       const servers = await Promise.all(serverIds.map(id => getCachedServerInfo(id)));
 
       socket.emit('servers-update', servers.filter(s => s !== null));
@@ -3041,7 +3036,7 @@ const debouncedBroadcastServerUpdate = debounce(async (serverId = null) => {
       c.Image.includes("itzg/minecraft-bedrock-server") || c.Image.includes("itzg/minecraft-bedrock")
     );
 
-    const serverIds = bedrockServers.map(c => (c.Labels && c.Labels["server-id"]) || c.Id);
+    const serverIds = bedrockServers.map(c => (c.Labels && c.Labels['server-id']) || c.Id);
     const servers = await Promise.all(serverIds.map(id => getCachedServerInfo(id)));
 
     io.emit('servers-update', servers.filter(s => s !== null));
