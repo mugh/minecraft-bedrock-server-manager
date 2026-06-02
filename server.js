@@ -79,6 +79,13 @@ async function getCachedServerInfo(serverId) {
   const info = await container.inspect();
   const serverPath = getServerPath(serverId);
 
+  // Check if this container is managed by this app (resides in DATA_DIR)
+  const hostDataPath = await getHostDataPath();
+  const dataMount = info.Mounts?.find(m => m.Destination === '/data' || m.Destination === '/app/minecraft-data');
+  const isManaged = dataMount && dataMount.Source && dataMount.Source.startsWith(hostDataPath);
+  const hasServerIdLabel = info.Config.Labels && info.Config.Labels['server-id'];
+
+
   // Get metadata
   let metadata = {};
   try {
@@ -158,6 +165,7 @@ async function getCachedServerInfo(serverId) {
   const ports = [];
   const networkPorts = info.NetworkSettings.Ports || {};
   for (const [key, bindings] of Object.entries(networkPorts)) {
+    if (!bindings) continue;
     for (const binding of bindings) {
       ports.push({
         IP: binding.HostIp || '0.0.0.0',
@@ -171,8 +179,8 @@ async function getCachedServerInfo(serverId) {
   const serverData = {
     id: serverId,
     name: metadata.name || info.Name.replace('/', ''),
-    containerName: metadata.containerName || serverId,
-    version: metadata.version || 'LATEST',
+    containerName: metadata.containerName || info.Name.replace('/', ''),
+    version: metadata.version || 'UNKNOWN',
     status: info.State.Status,
     players: playerCount,
     maxPlayers: maxPlayers,
@@ -181,7 +189,8 @@ async function getCachedServerInfo(serverId) {
     cpu: '0%',
     worldSize: worldSize,
     ports: ports,
-    webPort: PORT
+    webPort: PORT,
+    managed: !!(isManaged || hasServerIdLabel)
   };
 
   serverCache.set(cacheKey, { data: serverData, timestamp: now });
@@ -358,7 +367,12 @@ const getHostDataPath = async () => {
 // Helper: Get container by server ID
 const getContainer = async (serverId) => {
   const containers = await docker.listContainers({ all: true });
-  const container = containers.find(c => c.Labels['server-id'] === serverId);
+  const container = containers.find(c =>
+    (c.Labels && c.Labels['server-id'] === serverId) ||
+    c.Id === serverId ||
+    c.Id.startsWith(serverId) ||
+    (c.Names && c.Names.includes("/" + serverId))
+  );
   return container ? docker.getContainer(container.Id) : null;
 };
 
@@ -367,12 +381,25 @@ const getContainer = async (serverId) => {
 app.get('/api/servers', async (req, res) => {
   try {
     const containers = await docker.listContainers({ all: true });
-    const bedrockServers = containers.filter(c =>
-      c.Image.includes(BEDROCK_IMAGE) && c.Labels['server-id']
-    );
+    const bedrockServers = await Promise.all(containers.filter(c => {
+      const imageName = (c.Image || "").toLowerCase();
+      const labels = c.Labels || {};
+      const isBedrock = imageName.includes("bedrock") ||
+                        imageName.includes("minecraft") ||
+                        imageName.includes("itzg/") ||
+                        labels["server-id"] ||
+                        labels["server-name"];
+      return isBedrock;
+    }).map(async c => {
+      // Check if it's managed by this app
+      const hostDataPath = await getHostDataPath();
+      const dataMount = c.Mounts?.find(m => m.Destination === '/data' || m.Destination === '/app/minecraft-data');
+      const isManaged = (dataMount && dataMount.Source && dataMount.Source.startsWith(hostDataPath)) || (c.Labels && c.Labels["server-id"]);
+      return { ...c, isManaged };
+    }));
 
-    const serverIds = bedrockServers.map(c => c.Labels['server-id']);
-    const servers = await Promise.all(serverIds.map(serverId => getCachedServerInfo(serverId)));
+    const serverIds = bedrockServers.map(c => ({ id: (c.Labels && c.Labels['server-id']) || c.Id, managed: c.isManaged }));
+    const servers = await Promise.all(serverIds.map(async s => { const info = await getCachedServerInfo(s.id); return info ? { ...info, managed: s.managed } : null; }));
 
     res.json(servers.filter(s => s !== null));
   } catch (err) {
@@ -399,19 +426,37 @@ app.post('/api/servers/import', async (req, res) => {
       return res.status(404).json({ error: 'Container not found' });
     }
 
-    // Check if it's the correct image
-    if (!containerInfo.Image.includes(BEDROCK_IMAGE)) {
-      return res.status(400).json({ error: 'Container is not a Minecraft Bedrock server' });
-    }
-
-    // Inspect the container
+    // Inspect the container to get more info
     const container = docker.getContainer(containerInfo.Id);
     const details = await container.inspect();
 
+    console.log(`Importing container: ${trimmedName} - Image: ${containerInfo.Image}`);
+
+    // Check for Bedrock indicators
+    const imageName = (containerInfo.Image || "").toLowerCase();
+    const labels = containerInfo.Labels || {};
+    const env = details.Config?.Env || [];
+    const hasEULA = env.some(e => e.toLowerCase().includes("eula=true"));
+
+    const isBedrockImage = imageName.includes("bedrock") ||
+                           imageName.includes("minecraft") ||
+                           imageName.includes("itzg/") ||
+                           labels["server-id"] ||
+                           hasEULA;
+
+    if (!isBedrockImage) {
+      console.log(`Import check failed for ${trimmedName}. Details:`, JSON.stringify({
+        Image: containerInfo.Image,
+        Labels: labels,
+        Env: env.filter(e => e.startsWith("EULA") || e.startsWith("VERSION") || e.startsWith("SERVER_NAME"))
+      }, null, 2));
+      return res.status(400).json({ error: 'Container is not recognized as a Minecraft Bedrock server' });
+    }
+
     // Find the data mount
-    const dataMount = details.Mounts?.find(m => m.Destination === '/data');
+    const dataMount = details.Mounts?.find(m => m.Destination === '/data' || m.Destination === '/app/minecraft-data');
     if (!dataMount) {
-      return res.status(400).json({ error: 'Container does not have a /data mount' });
+      return res.status(400).json({ error: 'Container does not have a recognized data mount (/data or /app/minecraft-data)' });
     }
 
     const sourceDataPath = dataMount.Source;
@@ -1290,7 +1335,7 @@ async function handleDeleteServer(req, res) {
         }
       }
     }
-    
+
     const serverPath = getServerPath(req.params.id);
     await fs.remove(serverPath);
 
@@ -1300,9 +1345,9 @@ async function handleDeleteServer(req, res) {
     res.json({ message: 'Server deleted' });
   } catch (err) {
     console.error('Error in handleDeleteServer:', err);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Failed to delete server',
-      details: err.message 
+      details: err.message
     });
   }
 }
@@ -1312,13 +1357,13 @@ app.get('/api/servers/:id/logs', async (req, res) => {
   try {
     const container = await getContainer(req.params.id);
     if (!container) return res.status(404).json({ error: 'Server not found' });
-    
+
     const logs = await container.logs({
       stdout: true,
       stderr: true,
       tail: 100
     });
-    
+
     const logLines = logs.toString().split('\n').filter(l => l.trim());
     res.json(logLines);
   } catch (err) {
@@ -1332,21 +1377,21 @@ app.post('/api/servers/:id/command', async (req, res) => {
     const { command } = req.body;
     const container = await getContainer(req.params.id);
     if (!container) return res.status(404).json({ error: 'Server not found' });
-    
+
     // Use send-command script bundled with itzg/minecraft-bedrock-server
     const exec = await container.exec({
       Cmd: ['send-command', ...command.split(' ')],
       AttachStdout: true,
       AttachStderr: true
     });
-    
+
     const stream = await exec.start();
-    
+
     let output = '';
     stream.on('data', (chunk) => {
       output += chunk.toString();
     });
-    
+
     await new Promise((resolve, reject) => {
       stream.on('end', resolve);
       stream.on('error', reject);
@@ -1506,14 +1551,14 @@ app.post('/api/servers/:id/players/:playerName/kick', async (req, res) => {
     const { reason } = req.body;
     const container = await getContainer(req.params.id);
     if (!container) return res.status(404).json({ error: 'Server not found' });
-    
+
     const command = reason ? `kick "${playerName}" ${reason}` : `kick "${playerName}"`;
     const exec = await container.exec({
       Cmd: ['send-command', ...command.split(' ')],
       AttachStdout: true,
       AttachStderr: true
     });
-    
+
     await exec.start();
     // Broadcast server details update (players may have changed)
     setTimeout(() => broadcastServerDetails(req.params.id), 1000);
@@ -1530,14 +1575,14 @@ app.post('/api/servers/:id/players/:playerName/ban', async (req, res) => {
     const { reason } = req.body;
     const container = await getContainer(req.params.id);
     if (!container) return res.status(404).json({ error: 'Server not found' });
-    
+
     const command = reason ? `ban "${playerName}" ${reason}` : `ban "${playerName}"`;
     const exec = await container.exec({
       Cmd: ['send-command', ...command.split(' ')],
       AttachStdout: true,
       AttachStderr: true
     });
-    
+
     await exec.start();
     // Broadcast server details update (players may have changed)
     setTimeout(() => broadcastServerDetails(req.params.id), 1000);
@@ -1553,13 +1598,13 @@ app.post('/api/servers/:id/players/:playerName/op', async (req, res) => {
     const { playerName } = req.params;
     const container = await getContainer(req.params.id);
     if (!container) return res.status(404).json({ error: 'Server not found' });
-    
+
     const exec = await container.exec({
       Cmd: ['send-command', 'op', playerName],
       AttachStdout: true,
       AttachStderr: true
     });
-    
+
     await exec.start();
     // Broadcast server details update (player permissions changed)
     setTimeout(() => broadcastServerDetails(req.params.id), 1000);
@@ -1575,13 +1620,13 @@ app.post('/api/servers/:id/players/:playerName/deop', async (req, res) => {
     const { playerName } = req.params;
     const container = await getContainer(req.params.id);
     if (!container) return res.status(404).json({ error: 'Server not found' });
-    
+
     const exec = await container.exec({
       Cmd: ['send-command', 'deop', playerName],
       AttachStdout: true,
       AttachStderr: true
     });
-    
+
     await exec.start();
     // Broadcast server details update (player permissions changed)
     setTimeout(() => broadcastServerDetails(req.params.id), 1000);
@@ -1597,16 +1642,16 @@ app.get('/api/servers/:id/files', async (req, res) => {
     const serverPath = getServerPath(req.params.id);
     const requestedPath = req.query.path || '/';
     const fullPath = path.join(serverPath, requestedPath);
-    
+
     // Security: prevent path traversal
     if (!fullPath.startsWith(serverPath)) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    
+
     if (!await fs.pathExists(fullPath)) {
       return res.json([]);
     }
-    
+
     const items = await fs.readdir(fullPath);
     const files = await Promise.all(items.map(async item => {
       const itemPath = path.join(fullPath, item);
@@ -1619,7 +1664,7 @@ app.get('/api/servers/:id/files', async (req, res) => {
         modified: stats.mtime
       };
     }));
-    
+
     res.json(files);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1631,15 +1676,15 @@ app.get('/api/servers/:id/files/download', async (req, res) => {
   try {
     const serverPath = getServerPath(req.params.id);
     const filePath = path.join(serverPath, req.query.path);
-    
+
     if (!filePath.startsWith(serverPath)) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    
+
     if (!await fs.pathExists(filePath)) {
       return res.status(404).json({ error: 'File not found' });
     }
-    
+
     res.download(filePath);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1651,11 +1696,11 @@ app.delete('/api/servers/:id/files', async (req, res) => {
   try {
     const serverPath = getServerPath(req.params.id);
     const filePath = path.join(serverPath, req.query.path);
-    
+
     if (!filePath.startsWith(serverPath)) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    
+
     await fs.remove(filePath);
     res.json({ message: 'File deleted' });
   } catch (err) {
@@ -1670,18 +1715,18 @@ app.post('/api/servers/:id/files/upload', upload.array('files'), async (req, res
   try {
     const serverPath = getServerPath(req.params.id);
     const targetPath = path.join(serverPath, req.query.path || '/');
-    
+
     if (!targetPath.startsWith(serverPath)) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    
+
     await fs.ensureDir(targetPath);
-    
+
     for (const file of req.files) {
       const destPath = path.join(targetPath, file.originalname);
       await fs.move(file.path, destPath, { overwrite: true });
     }
-    
+
     res.json({ message: 'Files uploaded successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1695,11 +1740,11 @@ app.post('/api/servers/:id/files/rename', async (req, res) => {
     const serverPath = getServerPath(req.params.id);
     const oldFullPath = path.join(serverPath, oldPath);
     const newFullPath = path.join(path.dirname(oldFullPath), newName);
-    
+
     if (!oldFullPath.startsWith(serverPath) || !newFullPath.startsWith(serverPath)) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    
+
     await fs.move(oldFullPath, newFullPath);
     res.json({ message: 'File renamed successfully' });
   } catch (err) {
@@ -1712,11 +1757,11 @@ app.get('/api/servers/:id/files/content', async (req, res) => {
   try {
     const serverPath = getServerPath(req.params.id);
     const filePath = path.join(serverPath, req.query.path);
-    
+
     if (!filePath.startsWith(serverPath)) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    
+
     const content = await fs.readFile(filePath, 'utf8');
     res.send(content);
   } catch (err) {
@@ -1730,11 +1775,11 @@ app.put('/api/servers/:id/files/content', async (req, res) => {
     const { path: filePath, content } = req.body;
     const serverPath = getServerPath(req.params.id);
     const fullPath = path.join(serverPath, filePath);
-    
+
     if (!fullPath.startsWith(serverPath)) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    
+
     await fs.writeFile(fullPath, content, 'utf8');
     res.json({ message: 'File saved successfully' });
   } catch (err) {
@@ -1748,11 +1793,11 @@ app.post('/api/servers/:id/files/folder', async (req, res) => {
     const { path: folderPath, name } = req.body;
     const serverPath = getServerPath(req.params.id);
     const fullPath = path.join(serverPath, folderPath, name);
-    
+
     if (!fullPath.startsWith(serverPath)) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    
+
     await fs.ensureDir(fullPath);
     res.json({ message: 'Folder created successfully' });
   } catch (err) {
@@ -1765,9 +1810,9 @@ app.get('/api/servers/:id/backups', async (req, res) => {
   try {
     const serverPath = getServerPath(req.params.id);
     const backupPath = path.join(serverPath, 'backups');
-    
+
     await fs.ensureDir(backupPath);
-    
+
     const backups = await fs.readdir(backupPath);
     const backupList = await Promise.all(backups.map(async file => {
       const filePath = path.join(backupPath, file);
@@ -1780,7 +1825,7 @@ app.get('/api/servers/:id/backups', async (req, res) => {
         size: formatBytes(stats.size)
       };
     }));
-    
+
     res.json(backupList.reverse());
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1793,32 +1838,32 @@ app.post('/api/servers/:id/backups', async (req, res) => {
     const serverPath = getServerPath(req.params.id);
     const backupPath = path.join(serverPath, 'backups');
     const worldPath = path.join(serverPath, 'worlds');
-    
+
     await fs.ensureDir(backupPath);
-    
+
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const backupFile = path.join(backupPath, `backup-${timestamp}.zip`);
-    
+
     const output = fs.createWriteStream(backupFile);
     const archive = archiver('zip', { zlib: { level: 9 } });
-    
+
     output.on('close', () => {
-      res.json({ 
-        message: 'Backup created', 
+      res.json({
+        message: 'Backup created',
         file: `backup-${timestamp}.zip`,
         size: formatBytes(archive.pointer())
       });
     });
-    
+
     archive.on('error', (err) => {
       throw err;
     });
-    
+
     archive.pipe(output);
     archive.directory(worldPath, 'worlds');
     archive.file(path.join(serverPath, 'server.properties'), { name: 'server.properties' });
     await archive.finalize();
-    
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1844,7 +1889,7 @@ app.post('/api/servers/:id/zip', express.json(), async (req, res) => {
     });
 
     output.on('close', () => {
-      res.json({ 
+      res.json({
         message: 'Archive created successfully',
         zipName: path.basename(zipPath),
         size: archive.pointer()
@@ -1895,7 +1940,7 @@ app.post('/api/servers/:id/unzip', express.json(), async (req, res) => {
     const zip = new AdmZip(fullZipPath);
     zip.extractAllTo(fullExtractPath, true);
 
-    res.json({ 
+    res.json({
       message: 'File extracted successfully',
       extractPath: fullExtractPath
     });
@@ -1911,11 +1956,11 @@ app.post('/api/servers/:id/backups/:backupId/restore', async (req, res) => {
   try {
     const serverPath = getServerPath(req.params.id);
     const backupFile = path.join(serverPath, 'backups', req.params.backupId + '.zip');
-    
+
     if (!await fs.pathExists(backupFile)) {
       return res.status(404).json({ error: 'Backup not found' });
     }
-    
+
     // Stop server before restore
     const container = await getContainer(req.params.id);
     if (container) {
@@ -1924,16 +1969,16 @@ app.post('/api/servers/:id/backups/:backupId/restore', async (req, res) => {
         await container.stop();
       }
     }
-    
+
     // Extract backup
     const zip = new AdmZip(backupFile);
     zip.extractAllTo(serverPath, true);
-    
+
     // Restart server
     if (container) {
       await container.start();
     }
-    
+
     res.json({ message: 'Backup restored successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1945,14 +1990,14 @@ app.get('/api/servers/:id/config', async (req, res) => {
   try {
     const serverPath = getServerPath(req.params.id);
     const configPath = path.join(serverPath, 'server.properties');
-    
+
     if (!await fs.pathExists(configPath)) {
       return res.json({});
     }
-    
+
     const content = await fs.readFile(configPath, 'utf8');
     const config = {};
-    
+
     content.split('\n').forEach(line => {
       if (line.trim() && !line.startsWith('#')) {
         const [key, value] = line.split('=');
@@ -1961,7 +2006,7 @@ app.get('/api/servers/:id/config', async (req, res) => {
         }
       }
     });
-    
+
     res.json(config);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1973,7 +2018,7 @@ app.put('/api/servers/:id/config', async (req, res) => {
   try {
     const serverPath = getServerPath(req.params.id);
     const configPath = path.join(serverPath, 'server.properties');
-    
+
     const lines = Object.entries(req.body).map(([key, value]) => `${key}=${value}`);
     await fs.writeFile(configPath, lines.join('\n'));
 
@@ -1990,18 +2035,18 @@ app.put('/api/servers/:id/config', async (req, res) => {
 async function getDirectorySize(dirPath) {
   const files = await fs.readdir(dirPath);
   let size = 0;
-  
+
   for (const file of files) {
     const filePath = path.join(dirPath, file);
     const stats = await fs.stat(filePath);
-    
+
     if (stats.isDirectory()) {
       size += await getDirectorySize(filePath);
     } else {
       size += stats.size;
     }
   }
-  
+
   return size;
 }
 
@@ -2042,7 +2087,7 @@ async function findAvailablePort(startPort) {
   const allocatedPorts = new Set();
 
   containers.forEach(c => {
-    c.Ports.forEach(p => {
+    (c.Ports || []).forEach(p => {
       if (p.PublicPort) {
         allocatedPorts.add(p.PublicPort);
       }
@@ -2139,7 +2184,7 @@ async function getWorldName(serverId) {
   try {
     const serverPath = getServerPath(serverId);
     const configPath = path.join(serverPath, 'server.properties');
-    
+
     if (await fs.pathExists(configPath)) {
       const content = await fs.readFile(configPath, 'utf8');
       const levelNameMatch = content.match(/level-name=(.+)/);
@@ -3002,12 +3047,18 @@ io.on('connection', (socket) => {
   socket.on('request-initial-data', async () => {
     try {
       const containers = await docker.listContainers({ all: true });
-      const bedrockServers = containers.filter(c =>
-        c.Image.includes(BEDROCK_IMAGE) && c.Labels['server-id']
-      );
+      const bedrockServers = await Promise.all(containers.filter(c => {
+        const imageName = (c.Image || "").toLowerCase();
+        return imageName.includes("bedrock") || imageName.includes("minecraft") || imageName.includes("itzg/") || (c.Labels && (c.Labels["server-id"] || c.Labels["server-name"]));
+      }).map(async c => {
+        const hostDataPath = await getHostDataPath();
+        const dataMount = c.Mounts?.find(m => m.Destination === '/data' || m.Destination === '/app/minecraft-data');
+        const isManaged = (dataMount && dataMount.Source && dataMount.Source.startsWith(hostDataPath)) || (c.Labels && c.Labels["server-id"]);
+        return { ...c, isManaged };
+      }));
 
-      const serverIds = bedrockServers.map(c => c.Labels['server-id']);
-      const servers = await Promise.all(serverIds.map(id => getCachedServerInfo(id)));
+      const serverIds = bedrockServers.map(c => ({ id: (c.Labels && c.Labels['server-id']) || c.Id, managed: c.isManaged }));
+      const servers = await Promise.all(serverIds.map(async s => { const info = await getCachedServerInfo(s.id); return info ? { ...info, managed: s.managed } : null; }));
 
       socket.emit('servers-update', servers.filter(s => s !== null));
     } catch (err) {
@@ -3024,12 +3075,18 @@ io.on('connection', (socket) => {
 const debouncedBroadcastServerUpdate = debounce(async (serverId = null) => {
   try {
     const containers = await docker.listContainers({ all: true });
-    const bedrockServers = containers.filter(c =>
-      c.Image.includes(BEDROCK_IMAGE) && c.Labels['server-id']
-    );
+    const bedrockServers = await Promise.all(containers.filter(c => {
+        const imageName = (c.Image || "").toLowerCase();
+        return imageName.includes("bedrock") || imageName.includes("minecraft") || imageName.includes("itzg/") || (c.Labels && (c.Labels["server-id"] || c.Labels["server-name"]));
+      }).map(async c => {
+        const hostDataPath = await getHostDataPath();
+        const dataMount = c.Mounts?.find(m => m.Destination === '/data' || m.Destination === '/app/minecraft-data');
+        const isManaged = (dataMount && dataMount.Source && dataMount.Source.startsWith(hostDataPath)) || (c.Labels && c.Labels["server-id"]);
+        return { ...c, isManaged };
+      }));
 
-    const serverIds = bedrockServers.map(c => c.Labels['server-id']);
-    const servers = await Promise.all(serverIds.map(id => getCachedServerInfo(id)));
+    const serverIds = bedrockServers.map(c => ({ id: (c.Labels && c.Labels['server-id']) || c.Id, managed: c.isManaged }));
+    const servers = await Promise.all(serverIds.map(async s => { const info = await getCachedServerInfo(s.id); return info ? { ...info, managed: s.managed } : null; }));
 
     io.emit('servers-update', servers.filter(s => s !== null));
 
