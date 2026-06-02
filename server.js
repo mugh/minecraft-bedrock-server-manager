@@ -359,7 +359,12 @@ const getHostDataPath = async () => {
 // Helper: Get container by server ID
 const getContainer = async (serverId) => {
   const containers = await docker.listContainers({ all: true });
-  const container = containers.find(c => c.Labels['server-id'] === serverId);
+  const container = containers.find(c =>
+    c.Labels["server-id"] === serverId ||
+    c.Id === serverId ||
+    c.Id.startsWith(serverId) ||
+    (c.Names && c.Names.includes("/" + serverId))
+  );
   return container ? docker.getContainer(container.Id) : null;
 };
 
@@ -369,12 +374,11 @@ app.get('/api/servers', async (req, res) => {
   try {
     const containers = await docker.listContainers({ all: true });
     const bedrockServers = containers.filter(c =>
-      c.Image.includes(BEDROCK_IMAGE) && c.Labels['server-id']
+      c.Image.includes(BEDROCK_IMAGE)
     );
 
-    const serverIds = bedrockServers.map(c => c.Labels['server-id']);
+    const serverIds = bedrockServers.map(c => c.Labels["server-id"] || c.Id);
     const servers = await Promise.all(serverIds.map(serverId => getCachedServerInfo(serverId)));
-
     res.json(servers.filter(s => s !== null));
   } catch (err) {
     console.error(err);
@@ -401,7 +405,7 @@ app.post('/api/servers/import', async (req, res) => {
     }
 
     // Check if it's the correct image
-    if (!containerInfo.Image.includes(BEDROCK_IMAGE)) {
+    if (!containerInfo.Image.includes("minecraft-bedrock-server") && !containerInfo.Image.includes(BEDROCK_IMAGE)) {
       return res.status(400).json({ error: 'Container is not a Minecraft Bedrock server' });
     }
 
