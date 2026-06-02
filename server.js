@@ -158,6 +158,7 @@ async function getCachedServerInfo(serverId) {
   const ports = [];
   const networkPorts = info.NetworkSettings.Ports || {};
   for (const [key, bindings] of Object.entries(networkPorts)) {
+    if (!bindings) continue;
     for (const binding of bindings) {
       ports.push({
         IP: binding.HostIp || '0.0.0.0',
@@ -2042,7 +2043,7 @@ async function findAvailablePort(startPort) {
   const allocatedPorts = new Set();
 
   containers.forEach(c => {
-    c.Ports.forEach(p => {
+     (c.Ports || []).forEach(p => {
       if (p.PublicPort) {
         allocatedPorts.add(p.PublicPort);
       }
