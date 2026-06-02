@@ -375,8 +375,12 @@ app.get('/api/servers', async (req, res) => {
     const containers = await docker.listContainers({ all: true });
     const bedrockServers = containers.filter(c => {
       const imageName = (c.Image || "").toLowerCase();
-      // Broad check to find any Bedrock/Minecraft related container
-      const isBedrock = imageName.includes("bedrock") || imageName.includes("minecraft") || imageName.includes("itzg/");
+      const labels = c.Labels || {};
+      const isBedrock = imageName.includes("bedrock") ||
+                        imageName.includes("minecraft") ||
+                        imageName.includes("itzg/") ||
+                        labels["server-id"] ||
+                        labels["server-name"];
       return isBedrock;
     });
 
@@ -408,22 +412,36 @@ app.post('/api/servers/import', async (req, res) => {
       return res.status(404).json({ error: 'Container not found' });
     }
 
-    console.log(`Importing container: ${trimmedName} - Image: ${containerInfo.Image}`);
-    const imageName = (containerInfo.Image || "").toLowerCase();
-    const isBedrockImage = imageName.includes("bedrock") || imageName.includes("minecraft") || imageName.includes("itzg/");
-    if (!isBedrockImage) {
-      return res.status(400).json({ error: 'Container is not recognized as a Minecraft Bedrock server' });
-    }
-
-    // Inspect the container
+    // Inspect the container to get more info
     const container = docker.getContainer(containerInfo.Id);
     const details = await container.inspect();
 
-        // Find the data mount
-    // Older containers might use /data, others might use different paths
+    console.log(`Importing container: ${trimmedName} - Image: ${containerInfo.Image}`);
+
+    // Check for Bedrock indicators
+    const imageName = (containerInfo.Image || "").toLowerCase();
+    const labels = containerInfo.Labels || {};
+    const env = details.Config?.Env || [];
+    const hasEULA = env.some(e => e.toLowerCase().includes("eula=true"));
+
+    const isBedrockImage = imageName.includes("bedrock") ||
+                           imageName.includes("minecraft") ||
+                           imageName.includes("itzg/") ||
+                           labels["server-id"] ||
+                           hasEULA;
+
+    if (!isBedrockImage) {
+      console.log(`Import check failed for ${trimmedName}. Details:`, JSON.stringify({
+        Image: containerInfo.Image,
+        Labels: labels,
+        Env: env.filter(e => e.startsWith("EULA") || e.startsWith("VERSION") || e.startsWith("SERVER_NAME"))
+      }, null, 2));
+      return res.status(400).json({ error: 'Container is not recognized as a Minecraft Bedrock server' });
+    }
+
+    // Find the data mount
     const dataMount = details.Mounts?.find(m => m.Destination === '/data' || m.Destination === '/app/minecraft-data');
     if (!dataMount) {
-      console.log('Available mounts:', JSON.stringify(details.Mounts, null, 2));
       return res.status(400).json({ error: 'Container does not have a recognized data mount (/data or /app/minecraft-data)' });
     }
 
@@ -3017,7 +3035,7 @@ io.on('connection', (socket) => {
       const containers = await docker.listContainers({ all: true });
       const bedrockServers = containers.filter(c => {
         const imageName = (c.Image || "").toLowerCase();
-        return imageName.includes("bedrock") || imageName.includes("minecraft") || imageName.includes("itzg/");
+        return imageName.includes("bedrock") || imageName.includes("minecraft") || imageName.includes("itzg/") || (c.Labels && (c.Labels["server-id"] || c.Labels["server-name"]));
       });
 
       const serverIds = bedrockServers.map(c => (c.Labels && c.Labels['server-id']) || c.Id);
@@ -3040,7 +3058,7 @@ const debouncedBroadcastServerUpdate = debounce(async (serverId = null) => {
     const containers = await docker.listContainers({ all: true });
     const bedrockServers = containers.filter(c => {
         const imageName = (c.Image || "").toLowerCase();
-        return imageName.includes("bedrock") || imageName.includes("minecraft") || imageName.includes("itzg/");
+        return imageName.includes("bedrock") || imageName.includes("minecraft") || imageName.includes("itzg/") || (c.Labels && (c.Labels["server-id"] || c.Labels["server-name"]));
       });
 
     const serverIds = bedrockServers.map(c => (c.Labels && c.Labels['server-id']) || c.Id);
