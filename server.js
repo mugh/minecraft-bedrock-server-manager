@@ -79,6 +79,13 @@ async function getCachedServerInfo(serverId) {
   const info = await container.inspect();
   const serverPath = getServerPath(serverId);
 
+  // Check if this container is managed by this app (resides in DATA_DIR)
+  const hostDataPath = await getHostDataPath();
+  const dataMount = info.Mounts?.find(m => m.Destination === '/data' || m.Destination === '/app/minecraft-data');
+  const isManaged = dataMount && dataMount.Source && dataMount.Source.startsWith(hostDataPath);
+  const hasServerIdLabel = info.Config.Labels && info.Config.Labels['server-id'];
+
+
   // Get metadata
   let metadata = {};
   try {
@@ -172,8 +179,8 @@ async function getCachedServerInfo(serverId) {
   const serverData = {
     id: serverId,
     name: metadata.name || info.Name.replace('/', ''),
-    containerName: metadata.containerName || serverId,
-    version: metadata.version || 'LATEST',
+    containerName: metadata.containerName || info.Name.replace('/', ''),
+    version: metadata.version || 'UNKNOWN',
     status: info.State.Status,
     players: playerCount,
     maxPlayers: maxPlayers,
@@ -182,7 +189,8 @@ async function getCachedServerInfo(serverId) {
     cpu: '0%',
     worldSize: worldSize,
     ports: ports,
-    webPort: PORT
+    webPort: PORT,
+    managed: !!(isManaged || hasServerIdLabel)
   };
 
   serverCache.set(cacheKey, { data: serverData, timestamp: now });
@@ -373,7 +381,7 @@ const getContainer = async (serverId) => {
 app.get('/api/servers', async (req, res) => {
   try {
     const containers = await docker.listContainers({ all: true });
-    const bedrockServers = containers.filter(c => {
+    const bedrockServers = await Promise.all(containers.filter(c => {
       const imageName = (c.Image || "").toLowerCase();
       const labels = c.Labels || {};
       const isBedrock = imageName.includes("bedrock") ||
@@ -382,10 +390,16 @@ app.get('/api/servers', async (req, res) => {
                         labels["server-id"] ||
                         labels["server-name"];
       return isBedrock;
-    });
+    }).map(async c => {
+      // Check if it's managed by this app
+      const hostDataPath = await getHostDataPath();
+      const dataMount = c.Mounts?.find(m => m.Destination === '/data' || m.Destination === '/app/minecraft-data');
+      const isManaged = (dataMount && dataMount.Source && dataMount.Source.startsWith(hostDataPath)) || (c.Labels && c.Labels["server-id"]);
+      return { ...c, isManaged };
+    }));
 
-    const serverIds = bedrockServers.map(c => (c.Labels && c.Labels['server-id']) || c.Id);
-    const servers = await Promise.all(serverIds.map(serverId => getCachedServerInfo(serverId)));
+    const serverIds = bedrockServers.map(c => ({ id: (c.Labels && c.Labels['server-id']) || c.Id, managed: c.isManaged }));
+    const servers = await Promise.all(serverIds.map(async s => { const info = await getCachedServerInfo(s.id); return info ? { ...info, managed: s.managed } : null; }));
 
     res.json(servers.filter(s => s !== null));
   } catch (err) {
@@ -3033,13 +3047,18 @@ io.on('connection', (socket) => {
   socket.on('request-initial-data', async () => {
     try {
       const containers = await docker.listContainers({ all: true });
-      const bedrockServers = containers.filter(c => {
+      const bedrockServers = await Promise.all(containers.filter(c => {
         const imageName = (c.Image || "").toLowerCase();
         return imageName.includes("bedrock") || imageName.includes("minecraft") || imageName.includes("itzg/") || (c.Labels && (c.Labels["server-id"] || c.Labels["server-name"]));
-      });
+      }).map(async c => {
+        const hostDataPath = await getHostDataPath();
+        const dataMount = c.Mounts?.find(m => m.Destination === '/data' || m.Destination === '/app/minecraft-data');
+        const isManaged = (dataMount && dataMount.Source && dataMount.Source.startsWith(hostDataPath)) || (c.Labels && c.Labels["server-id"]);
+        return { ...c, isManaged };
+      }));
 
-      const serverIds = bedrockServers.map(c => (c.Labels && c.Labels['server-id']) || c.Id);
-      const servers = await Promise.all(serverIds.map(id => getCachedServerInfo(id)));
+      const serverIds = bedrockServers.map(c => ({ id: (c.Labels && c.Labels['server-id']) || c.Id, managed: c.isManaged }));
+      const servers = await Promise.all(serverIds.map(async s => { const info = await getCachedServerInfo(s.id); return info ? { ...info, managed: s.managed } : null; }));
 
       socket.emit('servers-update', servers.filter(s => s !== null));
     } catch (err) {
@@ -3056,13 +3075,18 @@ io.on('connection', (socket) => {
 const debouncedBroadcastServerUpdate = debounce(async (serverId = null) => {
   try {
     const containers = await docker.listContainers({ all: true });
-    const bedrockServers = containers.filter(c => {
+    const bedrockServers = await Promise.all(containers.filter(c => {
         const imageName = (c.Image || "").toLowerCase();
         return imageName.includes("bedrock") || imageName.includes("minecraft") || imageName.includes("itzg/") || (c.Labels && (c.Labels["server-id"] || c.Labels["server-name"]));
-      });
+      }).map(async c => {
+        const hostDataPath = await getHostDataPath();
+        const dataMount = c.Mounts?.find(m => m.Destination === '/data' || m.Destination === '/app/minecraft-data');
+        const isManaged = (dataMount && dataMount.Source && dataMount.Source.startsWith(hostDataPath)) || (c.Labels && c.Labels["server-id"]);
+        return { ...c, isManaged };
+      }));
 
-    const serverIds = bedrockServers.map(c => (c.Labels && c.Labels['server-id']) || c.Id);
-    const servers = await Promise.all(serverIds.map(id => getCachedServerInfo(id)));
+    const serverIds = bedrockServers.map(c => ({ id: (c.Labels && c.Labels['server-id']) || c.Id, managed: c.isManaged }));
+    const servers = await Promise.all(serverIds.map(async s => { const info = await getCachedServerInfo(s.id); return info ? { ...info, managed: s.managed } : null; }));
 
     io.emit('servers-update', servers.filter(s => s !== null));
 

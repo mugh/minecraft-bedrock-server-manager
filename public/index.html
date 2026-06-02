@@ -173,7 +173,7 @@
     </div>
 
     <div id="app"></div>
-    
+
     <!-- Upload Modal -->
     <div id="uploadModal" class="modal">
         <div class="bg-gray-800 rounded-lg p-4 w-80">
@@ -342,7 +342,7 @@
                 console.warn('Failed to load login config, using defaults:', err);
             }
         }
-        
+
         // Check if user is logged in
         function checkAuth() {
             const isAuthenticated = localStorage.getItem('isAuthenticated') === 'true';
@@ -365,7 +365,7 @@
 
             return true;
         }
-        
+
         // Check if login is locked out
         function isLoginLocked() {
             const attempts = parseInt(localStorage.getItem('loginAttempts') || '0');
@@ -380,7 +380,7 @@
 
             return false;
         }
-        
+
         // Get remaining lockout time in seconds
         function getRemainingLockoutTime() {
             const attempts = parseInt(localStorage.getItem('loginAttempts') || '0');
@@ -395,7 +395,7 @@
 
             return 0;
         }
-        
+
         // Update login button state based on lockout
         function updateLoginButtonState() {
             const loginButton = document.getElementById('loginButton');
@@ -420,7 +420,7 @@
                 }
             }
         }
-        
+
         // Handle login - This function is ONLY called when user clicks Login button or presses Enter
         // Refreshing the page does NOT call this function and should not increment attempt counter
         function checkLogin() {
@@ -473,7 +473,7 @@
                 }
             }
         }
-        
+
         // Check authentication on page load
         document.addEventListener('DOMContentLoaded', async () => {
             // Load login configuration first
@@ -487,7 +487,13 @@
                 document.getElementById('loginForm').classList.add('hidden');
                 document.getElementById('app').classList.remove('hidden');
 
-                // Initialize WebSocket connection
+
+        async function importUnmanagedServer(name) {
+            document.getElementById('importContainerName').value = name;
+            showImportModal();
+        }
+
+        // Initialize WebSocket connection
                 initializeWebSocket();
 
                 fetchServers();
@@ -514,7 +520,7 @@
                 }
             });
         });
-        
+
         const API_BASE = '/api';
         let socket;
         let state = {
@@ -1762,7 +1768,7 @@
         async function showEditModal(file) {
             state.selectedFile = file;
             document.getElementById('editFileName').textContent = file.name;
-            
+
             try {
                 const res = await fetch(`${API_BASE}/servers/${state.selectedServer}/files/content?path=${file.path}`);
                 const content = await res.text();
@@ -2561,7 +2567,27 @@
             return `<input type="text" value="${value}" onchange="state.config['${key}'] = this.value" class="w-full px-3 py-1.5 text-sm bg-gray-900 border border-gray-700 rounded-lg focus:outline-none focus:border-green-500">`;
         }
 
+
         function renderTabContent(server) {
+            if (server && !server.managed) {
+                return `
+                    <div class="flex flex-col items-center justify-center min-h-[60vh] p-6 text-center">
+                        <div class="text-64 mb-4">📥</div>
+                        <h2 class="text-xl font-bold mb-2">Unmanaged Server Detected</h2>
+                        <p class="text-gray-400 max-w-md mb-6">
+                            This container is running a Bedrock server but is not currently managed by this application (it's located outside the configured data directory).
+                        </p>
+                        <button onclick="importUnmanagedServer('${server.containerName}')" class="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg shadow-lg transition">
+                            Import this Container
+                        </button>
+                        <div class="mt-8 text-sm text-gray-500 text-left bg-gray-800 p-4 rounded-lg w-full max-w-md">
+                            <div class="font-bold mb-1">Details:</div>
+                            <div>ID: ${server.id}</div>
+                            <div>Image: ${server.image || 'itzg/minecraft-bedrock-server'}</div>
+                        </div>
+                    </div>
+                `;
+            }
             switch(state.activeTab) {
                 case 'dashboard':
                     return `
@@ -2587,7 +2613,7 @@
                                     </div>
                                 </div>
                             </div>
-                            
+
 
                             <div class="bg-gray-800 rounded-lg p-4 md:col-span-2">
                                 <h3 class="text-base font-semibold mb-3">👥 Online Players (${state.players.length})</h3>
@@ -2653,8 +2679,8 @@
                                 ${state.logs.map(log => `<div class="text-gray-400 mb-0.5">${log}</div>`).join('')}
                             </div>
                             <div class="flex gap-2">
-                                <input 
-                                    type="text" 
+                                <input
+                                    type="text"
                                     id="consoleInput"
                                     value="${state.consoleCommand}"
                                     oninput="state.consoleCommand = this.value"
@@ -2696,26 +2722,26 @@
                                                 </div>
                                             </div>
                                             <div class="flex gap-1.5 flex-wrap w-full sm:w-auto">
-                                                <button 
-                                                    onclick="opPlayer('${player.name}')" 
+                                                <button
+                                                    onclick="opPlayer('${player.name}')"
                                                     class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 rounded-lg flex-1 sm:flex-initial"
                                                     title="Make Operator">
                                                     👑 OP
                                                 </button>
-                                                <button 
-                                                    onclick="deopPlayer('${player.name}')" 
+                                                <button
+                                                    onclick="deopPlayer('${player.name}')"
                                                     class="px-2 py-1 text-xs bg-gray-600 hover:bg-gray-700 rounded-lg flex-1 sm:flex-initial"
                                                     title="Remove Operator">
                                                     ⬇️ Deop
                                                 </button>
-                                                <button 
-                                                    onclick="kickPlayer('${player.name}')" 
+                                                <button
+                                                    onclick="kickPlayer('${player.name}')"
                                                     class="px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 rounded-lg flex-1 sm:flex-initial"
                                                     title="Kick Player">
                                                     👢 Kick
                                                 </button>
-                                                <button 
-                                                    onclick="banPlayer('${player.name}')" 
+                                                <button
+                                                    onclick="banPlayer('${player.name}')"
                                                     class="px-2 py-1 text-xs bg-red-600 hover:bg-red-700 rounded-lg flex-1 sm:flex-initial"
                                                     title="Ban Player">
                                                     🚫 Ban
@@ -2761,7 +2787,7 @@
                             <div class="space-y-1.5">
                                 ${state.files.length === 0 ? '<div class="text-gray-500 text-center text-sm py-6">Empty directory</div>' : ''}
                                 ${state.files.map(file => `
-                                    <div 
+                                    <div
                                         class="flex items-center justify-between p-2 bg-gray-900 rounded-lg hover:bg-gray-700 cursor-pointer"
                                         oncontextmenu="showContextMenu(event, ${JSON.stringify(file).replace(/"/g, '&quot;')})"
                                         ondblclick="${file.type === 'directory' ? `navigateFolder('${file.path}')` : `showEditModal(${JSON.stringify(file).replace(/"/g, '&quot;')})`}">
@@ -3230,6 +3256,12 @@
             }
         }
 
+
+        async function importUnmanagedServer(name) {
+            document.getElementById('importContainerName').value = name;
+            showImportModal();
+        }
+
         // Initialize
         fetchServers();
 
@@ -3267,6 +3299,12 @@
 
         // Start the update loop
         updateLoop();
+
+
+        async function importUnmanagedServer(name) {
+            document.getElementById('importContainerName').value = name;
+            showImportModal();
+        }
 
         // Initialize tab styles after DOM is ready
         document.addEventListener('DOMContentLoaded', () => {
