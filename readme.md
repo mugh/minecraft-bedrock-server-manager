@@ -130,12 +130,15 @@ npm start
 
 Image : https://hub.docker.com/r/mugh/bdsmanagerforitzg
 
+docker image now have 2 tag, amd64 and arm64.
+arm64 version is untested.
+
 #### Docker Compose Example
 ---
 ```bash
 services:
   server-manager:
-    image: mugh/bdsmanagerforitzg:latest
+    image: mugh/bdsmanagerforitzg:latest-amd64
     ports:
       - "3001:3001"
     volumes:
