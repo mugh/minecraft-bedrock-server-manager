@@ -165,7 +165,7 @@ async function getCachedServerInfo(serverId) {
   const ports = [];
   const networkPorts = info.NetworkSettings.Ports || {};
   for (const [key, bindings] of Object.entries(networkPorts)) {
-    if (!bindings) continue;
+    if (!Array.isArray(bindings)) continue;
     for (const binding of bindings) {
       ports.push({
         IP: binding.HostIp || '0.0.0.0',
