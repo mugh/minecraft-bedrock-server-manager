@@ -180,7 +180,8 @@ You can customize the deployment by editing the `docker-compose.yml` file:
 
 ## [SUPPORT ME](https://sociabuzz.com/mughniy/donate)
 
-
+## Tips for .mctemplate
+most of .mctemplate will not work correctly if directly uploded and set as active world. A workaround is by creating world using the template from minecraft windows, export it as .mcworld then upload it via UI. Although not 100% guaranteed work, but worth to try if direct upload of .mctemplate did not work
 
 ## Screenshot
 ![enter image description here](https://github.com/mugh/minecraftbedrockservermanager/blob/main/Screenshot/sc1.png?raw=true)
