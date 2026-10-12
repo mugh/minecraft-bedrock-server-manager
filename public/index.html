@@ -2409,6 +2409,13 @@
                                             <button onclick="editServerVersion()" class="px-2 py-0.5 text-xs bg-gray-600 hover:bg-gray-500 rounded" title="Edit Version">✏️</button>
                                             <button onclick="editServerMemory()" class="px-2 py-0.5 text-xs bg-purple-600 hover:bg-purple-500 rounded" title="Edit Memory">🧠</button>
                                             <button onclick="changeServerPort()" class="px-2 py-0.5 text-xs bg-teal-600 hover:bg-blue-500 rounded" title="Change Port">🔌</button>
+                                            <button onclick="toggleTransport()" class="px-2 py-0.5 text-xs rounded-lg flex items-center gap-1.5 bg-gray-700 hover:bg-gray-600" title="Transport layer: click to switch between RakNet and NetherNet">
+                                                <span class="text-gray-400">Transport</span>
+                                                <span class="relative inline-block w-8 h-4 rounded-full transition-colors ${(currentServer.transport || 'nethernet') === 'nethernet' ? 'bg-purple-500' : 'bg-gray-500'}">
+                                                    <span class="absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all ${(currentServer.transport || 'nethernet') === 'nethernet' ? 'left-4' : 'left-0.5'}"></span>
+                                                </span>
+                                                <span class="font-semibold ${(currentServer.transport || 'nethernet') === 'nethernet' ? 'text-purple-300' : 'text-gray-200'}">${(currentServer.transport || 'nethernet') === 'nethernet' ? 'NetherNet' : 'RakNet'}</span>
+                                            </button>
                                         </div>
                                         <div class="text-xs text-gray-400 mt-0.5 truncate">
                                             ${currentServer.status} • ${currentServer.worldSize}
@@ -2506,6 +2513,70 @@
                 Swal.fire({
                     title: 'Error',
                     text: 'Failed to update server port: ' + err.message,
+                    icon: 'error',
+                    confirmButtonColor: '#10b981'
+                });
+            }
+        }
+
+        async function toggleTransport() {
+            const currentServer = state.servers.find(s => s.id === state.selectedServer);
+            if (!currentServer) return;
+
+            const current = (currentServer.transport || 'nethernet').toLowerCase();
+            const next = current === 'raknet' ? 'nethernet' : 'raknet';
+            const label = (t) => t === 'nethernet' ? 'NetherNet' : 'RakNet';
+            const isRunning = currentServer.status === 'running';
+
+            const result = await Swal.fire({
+                title: 'Switch Transport',
+                html: `
+                    <div class="text-left text-sm">
+                        <p class="mb-2">Change <code>transport</code> in server.properties:</p>
+                        <p class="mb-2"><span class="text-gray-400">${label(current)}</span> → <span class="text-purple-400 font-semibold">${label(next)}</span></p>
+                        <p class="text-xs text-yellow-400">⚠️ The server must be restarted for this to take effect. Players may not be able to connect with clients that don't support ${label(next)}.</p>
+                    </div>
+                `,
+                icon: 'question',
+                showCancelButton: true,
+                showDenyButton: isRunning,
+                confirmButtonText: isRunning ? 'Save & Restart' : 'Save',
+                denyButtonText: 'Save only',
+                confirmButtonColor: '#10b981',
+                denyButtonColor: '#f59e0b',
+                cancelButtonColor: '#6b7280'
+            });
+
+            if (result.isDismissed) return;
+            const restart = isRunning && result.isConfirmed;
+
+            try {
+                showLoading();
+                const response = await fetch(`${API_BASE}/servers/${state.selectedServer}/transport`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ transport: next, restart })
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || 'Failed to update transport');
+
+                // Reflect the change immediately in local state
+                currentServer.transport = next;
+                state.forceFullRender = true;
+                await fetchServers();
+                hideLoading();
+
+                Swal.fire({
+                    title: 'Success',
+                    html: `✅ Transport set to <b>${label(next)}</b>.<br><br>${data.restarted ? 'Server has been restarted.' : (isRunning ? '⚠️ Restart the server to apply the change.' : 'It will be used on next start.')}`,
+                    icon: 'success',
+                    confirmButtonColor: '#10b981'
+                });
+            } catch (err) {
+                hideLoading();
+                Swal.fire({
+                    title: 'Error',
+                    text: 'Failed to update transport: ' + err.message,
                     icon: 'error',
                     confirmButtonColor: '#10b981'
                 });
