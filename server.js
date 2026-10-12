@@ -31,6 +31,9 @@ function debounce(func, wait) {
   };
 }
 
+// Transport used by the Bedrock server when server.properties has no "transport" line
+const DEFAULT_TRANSPORT = 'nethernet';
+
 // Cached file read helper
 async function readCachedFile(filePath, parser = 'text') {
   const cacheKey = `${filePath}:${parser}`;
@@ -161,6 +164,18 @@ async function getCachedServerInfo(serverId) {
     }
   } catch (err) {}
 
+  // Get transport layer (raknet / nethernet) from config
+  // If server.properties has no transport line, the server falls back to its built-in default
+  let transport = DEFAULT_TRANSPORT;
+  try {
+    const configPath = path.join(serverPath, 'server.properties');
+    const content = await readCachedFile(configPath);
+    const transportMatch = content.match(/^\s*transport\s*=\s*(\S+)/mi);
+    if (transportMatch) {
+      transport = transportMatch[1].trim().toLowerCase();
+    }
+  } catch (err) {}
+
   // Convert ports to array format matching listContainers
   const ports = [];
   const networkPorts = info.NetworkSettings.Ports || {};
@@ -184,6 +199,7 @@ async function getCachedServerInfo(serverId) {
     status: info.State.Status,
     players: playerCount,
     maxPlayers: maxPlayers,
+    transport: transport,
     uptime: info.State.Running ? formatUptime(info.State.StartedAt) : '0h 0m',
     memory: formatBytes(info.HostConfig.Memory || 0),
     cpu: '0%',
@@ -2026,6 +2042,68 @@ app.put('/api/servers/:id/config', async (req, res) => {
     setTimeout(() => broadcastServerDetails(req.params.id), 500);
 
     res.json({ message: 'Configuration saved' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/servers/:id/transport - Toggle transport layer (raknet / nethernet) in server.properties
+app.put('/api/servers/:id/transport', async (req, res) => {
+  try {
+    const transport = String(req.body.transport || '').trim().toLowerCase();
+    if (!['raknet', 'nethernet'].includes(transport)) {
+      return res.status(400).json({ error: 'Transport must be "raknet" or "nethernet"' });
+    }
+
+    const serverId = req.params.id;
+    const serverPath = getServerPath(serverId);
+    const configPath = path.join(serverPath, 'server.properties');
+
+    if (!await fs.pathExists(configPath)) {
+      return res.status(404).json({ error: 'server.properties not found' });
+    }
+
+    // Update only the transport line, keep comments and other settings intact
+    const content = await fs.readFile(configPath, 'utf8');
+    const eol = content.includes('\r\n') ? '\r\n' : '\n';
+    const lines = content.split(/\r?\n/);
+    let found = false;
+
+    for (let i = 0; i < lines.length; i++) {
+      if (/^\s*transport\s*=/i.test(lines[i])) {
+        lines[i] = `transport=${transport}`;
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) {
+      // Insert before trailing empty line(s) so file formatting stays clean
+      while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+      lines.push(`transport=${transport}`, '');
+    }
+
+    await fs.writeFile(configPath, lines.join(eol));
+
+    invalidateFileCache(configPath);
+    invalidateServerCache(serverId);
+
+    // Optionally restart so the change takes effect
+    let restarted = false;
+    if (req.body.restart) {
+      const container = await getContainer(serverId);
+      if (container) {
+        const info = await container.inspect();
+        if (info.State.Running) {
+          await container.restart();
+          restarted = true;
+        }
+      }
+    }
+
+    setTimeout(() => broadcastServerUpdate(serverId), restarted ? 5000 : 500);
+
+    res.json({ message: 'Transport updated', transport, restarted });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
