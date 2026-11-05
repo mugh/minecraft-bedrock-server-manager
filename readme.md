@@ -3,12 +3,19 @@
 
 Full-stack application to manage multiple Minecraft Bedrock servers using itzg/docker-minecraft-bedrock-server.
 
+## Nethernet Support
+
+The application now support nethernet fully. Everytime server created, will expose TCP and UDP (for raknet) on specified port (like 19132) beside that also expose 16 block UDP port for nethernet.
+
+Old server which previously using raknet can be migrated to support nethernet by clicking import button and input container name, migrate will be executed instead of importing.
+
 ## How it works
 
 The aplication will deploy a minecraft bedrock server using docker itzg/docker-minecraft-bedrock-server latest image, assign port, persistent volume. The aplication then act as UI to manage this container.
 
 ### Features
 - ✅ Real-time WebSocket Updates
+- ✅ Nethernet Compatible
 - ✅ Multiple server management
 - ✅ Imprt current itzg container server
 - ✅ Select server version (Latest, Latest Preview or custom)
@@ -182,6 +189,105 @@ You can customize the deployment by editing the `docker-compose.yml` file:
 
 ## Tips for .mctemplate
 most of .mctemplate will not work correctly if directly uploded and set as active world. A workaround is by creating world using the template from minecraft windows, export it as .mcworld then upload it via UI. Although not 100% guaranteed work, but worth to try if direct upload of .mctemplate did not work
+
+---
+
+## Expose Home Server To Public IP Using VPS and Wireguard
+If you like me, using homeserver which dont have public IP, you can rent cheapest VPS service which usually come with public IP as proxy and use wireguard.
+
+Below guide is for Ubuntu/Debian systems, whether on a VPS or a home server.
+
+#### Install and generate keys (on both the VPS and the home server).
+ 
+    sudo -i
+    apt update && apt install -y wireguard
+    umask 077
+    wg genkey | tee /etc/wireguard/privatekey | wg pubkey >/etc/wireguard/publickey
+    echo "PRIVATE: $(cat /etc/wireguard/privatekey)"
+    echo "PUBLIC: $(cat /etc/wireguard/publickey)"
+
+
+Make a note of the keys for each machine. The private key is for use only on that specific machine—do not share it. The public keys should be exchanged between the VPS and the home server.
+
+#### Specifically for the VPS, check the name of your internet interface:
+
+    ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}'
+
+The result will typically be `eth0` or `ens3`. If it is something other than `eth0`, make sure to update it in the VPS configuration provided below. 
+
+
+#### Config on VPS
+
+This setting can be fetch via aplication by clicking wireguard button.
+Create /etc/wireguard/wg0.conf file:
+
+    [Interface]
+    Address = 10.8.0.1/24
+    ListenPort = 51820
+    PrivateKey = <VPS_PRIVATE_KEY>
+    PostUp = sysctl -w net.ipv4.ip_forward=1
+    PostUp = iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 19132:19136 -j DNAT --to-destination 10.8.0.2
+    PostUp = iptables -t nat -A PREROUTING -i eth0 -p udp --dport 19132:19136 -j DNAT --to-destination 10.8.0.2
+    PostUp = iptables -t nat -A PREROUTING -i eth0 -p udp --dport 20000:20079 -j DNAT --to-destination 10.8.0.2
+    PostUp = iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
+    PostUp = iptables -I FORWARD -i eth0 -o wg0 -j ACCEPT
+    PostUp = iptables -I FORWARD -i wg0 -o eth0 -m state --state ESTABLISHED,RELATED -j ACCEPT
+    PostDown = iptables -t nat -D PREROUTING -i eth0 -p tcp --dport 19132:19136 -j DNAT --to-destination 10.8.0.2
+    PostDown = iptables -t nat -D PREROUTING -i eth0 -p udp --dport 19132:19136 -j DNAT --to-destination 10.8.0.2
+    PostDown = iptables -t nat -D PREROUTING -i eth0 -p udp --dport 20000:20079 -j DNAT --to-destination 10.8.0.2
+    PostDown = iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE
+    PostDown = iptables -D FORWARD -i eth0 -o wg0 -j ACCEPT
+    PostDown = iptables -D FORWARD -i wg0 -o eth0 -m state --state ESTABLISHED,RELATED -j ACCEPT
+    
+    [Peer]
+    PublicKey = <HOME_PUBLIC_KEY>
+    AllowedIPs = 10.8.0.2/32
+
+#### Configuration at home
+
+Create the file /etc/wireguard/wg0.conf:
+
+    [Interface]
+    Address = 10.8.0.2/24
+    PrivateKey = <HOME_PRIVATE_KEY>
+    
+    [Peer]
+    PublicKey = <VPS_PUBLIC_KEY>
+    Endpoint = <VPS_PUBLIC_IP>:51820
+    AllowedIPs = 10.8.0.1/32
+    PersistentKeepalive = 25
+
+PersistentKeepalive keeps the connection alive even if the home network is behind NAT.
+
+#### Firewall
+
+On the VPS, open the necessary ports. If you are using ufw:
+
+    ufw allow 51820/udp
+    ufw allow 19132:19136/tcp
+    ufw allow 19132:19136/udp
+    ufw allow 20000:20079/udp
+
+If your VPS is from a cloud provider that uses its own security groups or firewall, ensure you also open these same ports in the provider's control panel. This step is frequently overlooked. At home, if you are using `ufw`, allow traffic from the tunnel:
+
+    ufw allow in on wg0
+
+#### Start the service (VPS first, then the home machine)
+
+    systemctl enable --now wg-quick@wg0
+    wg show
+
+In the `wg show` output, look for the "latest handshake" line. If it appears, the tunnel is active. Then, test with a ping:
+
+    ping -c 3 10.8.0.2    # from the VPS
+    ping -c 3 10.8.0.1    # from the home machine
+
+If there is no handshake
+Verify that the public keys have not been swapped or copied incorrectly (e.g., accidental extra spaces).
+Ensure the "Endpoint" on the home machine uses the correct VPS IP address, and that UDP port 51820 is open on both the VPS and the provider's firewall panel.
+On the VPS, check `journalctl -u wg-quick@wg0` for errors. A common issue is an incorrect interface name (e.g., `eth0`), which causes `iptables` commands to fail.
+Verify that IP forwarding is enabled: `sysctl net.ipv4.ip_forward` should return `1`.
+
 
 ## Screenshot
 ![enter image description here](https://github.com/mugh/minecraftbedrockservermanager/blob/main/Screenshot/sc1.png?raw=true)
