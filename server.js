@@ -205,6 +205,7 @@ async function getCachedServerInfo(serverId) {
     cpu: '0%',
     worldSize: worldSize,
     ports: ports,
+    udpStart: metadata.udpStart || null,
     webPort: PORT,
     managed: !!(isManaged || hasServerIdLabel)
   };
@@ -332,6 +333,299 @@ app.use(express.static(path.join(__dirname, 'public')));
 const DATA_DIR = process.env.DATA_DIR;
 const BEDROCK_IMAGE = 'itzg/minecraft-bedrock-server';
 
+// ==================== NETHERNET SUPPORT ====================
+// NetherNet (default transport sejak BDS 26.50) butuh:
+//  - TCP on server-port for signalling (handshake)
+//  - one UDP port per client for gameplay (a range; host port = container port)
+//  - server-udp-ports in server.properties, with the public IP so outside clients can connect
+// RakNet (older versions) keeps working through 19132/udp, which is still published.
+
+// Manager settings are stored in DATA_DIR/manager-settings.json (editable from the UI).
+// PUBLIC_IP in the environment is only used as an initial value if it was never set in the UI.
+const net = require('net');
+const settingsFile = () => path.join(DATA_DIR, 'manager-settings.json');
+async function readSettings() {
+  try { return await fs.readJson(settingsFile()); } catch (e) { return {}; }
+}
+async function writeSettings(settings) {
+  await fs.ensureDir(DATA_DIR);
+  await fs.writeJson(settingsFile(), settings, { spaces: 2 });
+}
+// Public IP advertised to clients by NetherNet (must be an IPv4 literal, not a hostname)
+async function getPublicIp() {
+  const s = await readSettings();
+  const ip = String(s.publicIp !== undefined ? s.publicIp : (process.env.PUBLIC_IP || '')).trim();
+  return net.isIPv4(ip) ? ip : '';
+}
+const UDP_RANGE_BASE = 20000;                       // start of the UDP range (far from the 19132+ game ports)
+const UDP_PORTS_PER_SERVER = 16;                    // BDS limits server-udp-ports to 16 mappings
+
+// Find a UDP block not used by any other server (stored in metadata.json)
+async function allocateUdpStart() {
+  const used = new Set();
+  try {
+    for (const id of await fs.readdir(DATA_DIR)) {
+      try {
+        const m = await fs.readJson(path.join(DATA_DIR, id, 'metadata.json'));
+        if (m.udpStart) used.add(m.udpStart);
+      } catch (e) {}
+    }
+  } catch (e) {}
+  let start = UDP_RANGE_BASE;
+  while (used.has(start)) start += UDP_PORTS_PER_SERVER;
+  return start;
+}
+
+// Write server-udp-ports (one line per port). A transport already set by the user is preserved;
+// if there is no transport line yet, nethernet is added (older server versions ignore it).
+async function applyNethernetProps(serverPath, udpStart) {
+  const file = path.join(serverPath, 'server.properties');
+  const content = await fs.readFile(file, 'utf8');
+  const eol = content.includes('\r\n') ? '\r\n' : '\n';
+  const hasTransport = /^\s*transport\s*=/mi.test(content);
+  const publicIp = await getPublicIp();
+  const lines = content.split(/\r?\n/).filter(l => !/^\s*server-udp-ports\s*=/i.test(l));
+  while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+  if (!hasTransport) lines.push('transport=nethernet');
+  for (let i = 0; i < UDP_PORTS_PER_SERVER; i++) {
+    const p = udpStart + i;
+    lines.push(`server-udp-ports=${publicIp ? publicIp + ':' : ''}${p}:${p}`);
+  }
+  lines.push('');
+  await fs.writeFile(file, lines.join(eol));
+  invalidateFileCache(file);
+}
+
+// Get (or allocate) the server's UDP block, save it to metadata.json,
+// and sync server.properties if the file already exists.
+async function getUdpStart(serverId, metadata) {
+  const serverPath = getServerPath(serverId);
+  const metadataPath = path.join(serverPath, 'metadata.json');
+  let disk = {};
+  try { disk = await fs.readJson(metadataPath); } catch (e) {}
+  let start = disk.udpStart || (metadata && metadata.udpStart);
+  if (!start) start = await allocateUdpStart();
+  if (disk.udpStart !== start) {
+    disk.udpStart = start;
+    await fs.ensureDir(serverPath);
+    await fs.writeJson(metadataPath, disk, { spaces: 2 });
+    invalidateFileCache(metadataPath);
+  }
+  if (metadata) metadata.udpStart = start;
+  try {
+    if (await fs.pathExists(path.join(serverPath, 'server.properties'))) {
+      await applyNethernetProps(serverPath, start);
+    }
+  } catch (e) {
+    console.warn('Failed to apply NetherNet properties:', e.message);
+  }
+  return start;
+}
+
+// Single place for the container configuration (replaces 7 duplicated createContainer blocks)
+function buildContainerConfig({ serverId, name, version, memory, gamePort, udpStart, hostServerPath }) {
+  const PortBindings = {
+    '19132/tcp': [{ HostPort: String(gamePort) }],   // NetherNet signalling
+    '19132/udp': [{ HostPort: String(gamePort) }]    // RakNet (older server versions)
+  };
+  const ExposedPorts = { '19132/tcp': {}, '19132/udp': {} };
+  for (let i = 0; i < UDP_PORTS_PER_SERVER; i++) {
+    const key = `${udpStart + i}/udp`;
+    PortBindings[key] = [{ HostPort: String(udpStart + i) }];   // host = container
+    ExposedPorts[key] = {};
+  }
+  return {
+    Image: BEDROCK_IMAGE,
+    name: serverId,
+    Labels: {
+      'server-id': serverId,
+      'server-name': name
+    },
+    Env: [
+      'EULA=TRUE',
+      'VERSION=' + version,
+      'SERVER_NAME=' + name
+    ],
+    ExposedPorts,
+    HostConfig: {
+      Binds: [`${hostServerPath}:/data`],
+      PortBindings,
+      RestartPolicy: { Name: 'unless-stopped' },
+      Memory: memory
+    }
+  };
+}
+
+// true if VERSION is numeric (e.g. 1.21.80) and older than 1.26.30 (before the `transport` key existed).
+// LATEST / PREVIEW / any other format is treated as a new version.
+const NETHERNET_MIN_VERSION = [1, 26, 30];
+function isLegacyOnlyVersion(version) {
+  const v = String(version || '').trim();
+  if (!/^\d+(\.\d+)+$/.test(v)) return false;
+  const parts = v.split('.').map(Number);
+  for (let i = 0; i < NETHERNET_MIN_VERSION.length; i++) {
+    const a = parts[i] || 0;
+    const b = NETHERNET_MIN_VERSION[i];
+    if (a !== b) return a < b;
+  }
+  return false;
+}
+
+// Force the transport value in server.properties (replace the existing line, or add one)
+async function setTransport(serverPath, transport) {
+  const file = path.join(serverPath, 'server.properties');
+  const content = await fs.readFile(file, 'utf8');
+  const eol = content.includes('\r\n') ? '\r\n' : '\n';
+  const lines = content.split(/\r?\n/);
+  let found = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\s*transport\s*=/i.test(lines[i])) { lines[i] = `transport=${transport}`; found = true; }
+  }
+  if (!found) {
+    while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+    lines.push(`transport=${transport}`, '');
+  }
+  await fs.writeFile(file, lines.join(eol));
+  invalidateFileCache(file);
+}
+
+// Analyze the source container on import / conversion: connection model (from exposed ports) + version
+function analyzeMigration(details, serverVersion, migrate) {
+  const bindings = details.HostConfig?.PortBindings || {};
+  const keys = Object.keys(bindings);
+  const hadTcp = keys.some(k => k.endsWith('/tcp'));
+  const udpKey = keys.includes('19132/udp') ? '19132/udp' : keys.find(k => k.endsWith('/udp'));
+  const hp = udpKey ? parseInt(bindings[udpKey]?.[0]?.HostPort, 10) : NaN;
+  const legacyRaknet = !hadTcp;                       // UDP only => RakNet model
+  const out = {
+    keys, hadTcp, legacyRaknet,
+    origHostPort: Number.isInteger(hp) && hp > 0 ? hp : null,
+    convert: false, keepRaknet: false, reason: ''
+  };
+  if (migrate === false) {
+    out.reason = 'Conversion disabled by user; transport setting unchanged';
+  } else if (!legacyRaknet) {
+    out.reason = 'Original already exposes TCP; transport setting unchanged';
+  } else if (isLegacyOnlyVersion(serverVersion)) {
+    out.keepRaknet = true;
+    out.reason = `Version ${serverVersion} predates NetherNet; stays on RakNet`;
+  } else {
+    out.convert = true;
+    out.reason = 'Original exposed UDP only (RakNet); converted to NetherNet';
+  }
+  return out;
+}
+
+// Validate a manual UDP block (UDP_PORTS_PER_SERVER consecutive ports). Returns an error message or null.
+async function validateUdpStart(serverId, start, gamePort) {
+  const n = UDP_PORTS_PER_SERVER;
+  if (!Number.isInteger(start) || start < 1024 || start + n - 1 > 65535) {
+    return `UDP block start must be an integer between 1024 and ${65535 - n + 1}`;
+  }
+  const end = start + n - 1;
+  if (gamePort >= start && gamePort <= end) {
+    return `UDP block ${start}-${end} overlaps the game port ${gamePort}`;
+  }
+  try {
+    for (const id of await fs.readdir(DATA_DIR)) {
+      if (id === serverId) continue;
+      try {
+        const m = await fs.readJson(path.join(DATA_DIR, id, 'metadata.json'));
+        if (m.udpStart && start <= m.udpStart + n - 1 && end >= m.udpStart) {
+          return `UDP block ${start}-${end} overlaps server "${m.name || id}" (${m.udpStart}-${m.udpStart + n - 1})`;
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+  return null;
+}
+
+// ---- WireGuard (DNAT rules on the VPS) ----
+function mergePortRanges(ports) {
+  const sorted = [...new Set(ports)].sort((a, b) => a - b);
+  const ranges = [];
+  for (const p of sorted) {
+    const last = ranges[ranges.length - 1];
+    if (last && p === last[1] + 1) last[1] = p; else ranges.push([p, p]);
+  }
+  return ranges;
+}
+
+async function getWgSettings() {
+  const s = await readSettings();
+  return {
+    publicIface: s.wgPublicIface || 'eth0',
+    wgInterface: s.wgInterface || 'wg0',
+    homeIp: s.wgHomeIp || '10.8.0.2'
+  };
+}
+
+// Collect the host ports actually published by all manager-created servers
+async function collectPublishedPorts() {
+  const tcp = [];
+  const udp = [];
+  const servers = [];
+  let ids = [];
+  try { ids = await fs.readdir(DATA_DIR); } catch (e) {}
+  for (const id of ids) {
+    let meta;
+    try { meta = await fs.readJson(path.join(getServerPath(id), 'metadata.json')); } catch (e) { continue; }
+    let info;
+    try {
+      const c = await getContainer(id);
+      if (!c) continue;
+      info = await c.inspect();
+    } catch (e) { continue; }
+    const entry = { id, name: meta.name || id, tcp: [], udp: [] };
+    for (const [key, arr] of Object.entries(info.HostConfig?.PortBindings || {})) {
+      const proto = key.split('/')[1];
+      for (const b of (arr || [])) {
+        const p = parseInt(b.HostPort, 10);
+        if (!p) continue;
+        if (proto === 'tcp') { tcp.push(p); entry.tcp.push(p); }
+        else if (proto === 'udp') { udp.push(p); entry.udp.push(p); }
+      }
+    }
+    servers.push(entry);
+  }
+  return { tcpRanges: mergePortRanges(tcp), udpRanges: mergePortRanges(udp), servers };
+}
+
+function buildWireguardRules({ publicIface, wgInterface, homeIp, tcpRanges, udpRanges }) {
+  const fmt = ([a, b]) => (a === b ? `${a}` : `${a}:${b}`);
+  const dnat = (act, proto, r) =>
+    `iptables -t nat -${act} PREROUTING -i ${publicIface} -p ${proto} --dport ${fmt(r)} -j DNAT --to-destination ${homeIp}`;
+  const common = (a, i) => ([
+    `iptables -t nat -${a} POSTROUTING -o ${wgInterface} -j MASQUERADE`,
+    `iptables -${i} FORWARD -i ${publicIface} -o ${wgInterface} -j ACCEPT`,
+    `iptables -${i} FORWARD -i ${wgInterface} -o ${publicIface} -m state --state ESTABLISHED,RELATED -j ACCEPT`
+  ]);
+
+  const up = ['sysctl -w net.ipv4.ip_forward=1'];
+  const down = [];
+  for (const r of tcpRanges) { up.push(dnat('A', 'tcp', r)); down.push(dnat('D', 'tcp', r)); }
+  for (const r of udpRanges) { up.push(dnat('A', 'udp', r)); down.push(dnat('D', 'udp', r)); }
+  up.push(...common('A', 'I'));
+  down.push(...common('D', 'D'));
+
+  const text = [...up.map(l => `PostUp = ${l}`), ...down.map(l => `PostDown = ${l}`)].join('\n') + '\n';
+  const ufw = [
+    ...tcpRanges.map(r => `ufw allow ${fmt(r)}/tcp`),
+    ...udpRanges.map(r => `ufw allow ${fmt(r)}/udp`)
+  ].join('\n') + '\n';
+  return { text, ufw };
+}
+
+async function waitForFile(filePath, timeoutMs = 60000) {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    if (await fs.pathExists(filePath)) return true;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  return false;
+}
+// ==================== END NETHERNET SUPPORT ====================
+
 // Helper: Get server data path
 const getServerPath = (serverId) => path.join(DATA_DIR, serverId);
 
@@ -427,7 +721,7 @@ app.get('/api/servers', async (req, res) => {
 // POST /api/servers/import - Import existing server
 app.post('/api/servers/import', async (req, res) => {
   try {
-    const { containerName, port } = req.body;
+    let { containerName, port, migrate } = req.body;
     if (!containerName || !containerName.trim()) {
       return res.status(400).json({ error: 'Container name is required' });
     }
@@ -475,28 +769,123 @@ app.post('/api/servers/import', async (req, res) => {
       return res.status(400).json({ error: 'Container does not have a recognized data mount (/data or /app/minecraft-data)' });
     }
 
-    const sourceDataPath = dataMount.Source;
+    // Mount.Source is a path on the HOST. The manager runs inside a container and can only see
+    // its own data through DATA_DIR, so host paths inside the manager volume are translated first.
+    // (This is why importing a server created by this manager failed: the folder was "not found".)
+    const hostDataPath = await getHostDataPath();
+    const hostSource = dataMount.Source;
+    let sourceDataPath = hostSource;
+    let managedId = null;   // set when this container's data lives inside DATA_DIR (created by this manager)
+    if (hostDataPath && (hostSource === hostDataPath || hostSource.startsWith(hostDataPath + path.sep))) {
+      const rel = path.relative(hostDataPath, hostSource);
+      sourceDataPath = path.join(DATA_DIR, rel);
+      if (rel && !rel.startsWith('..') && !rel.includes(path.sep)) managedId = rel;
+    }
 
     // Verify the structure
     const serverPropertiesPath = path.join(sourceDataPath, 'server.properties');
     const worldsPath = path.join(sourceDataPath, 'worlds');
 
     if (!(await fs.pathExists(serverPropertiesPath))) {
-      return res.status(400).json({ error: 'Invalid server structure: server.properties not found' });
+      return res.status(400).json({
+        error: `Invalid server structure: server.properties not found in ${sourceDataPath}` +
+               (sourceDataPath !== hostSource ? ` (host path: ${hostSource})` : ' - is this path mounted into the manager container?')
+      });
     }
 
+    // worlds/ is only created the first time the server runs; a server that never started can still be imported
     if (!(await fs.pathExists(worldsPath))) {
-      return res.status(400).json({ error: 'Invalid server structure: worlds directory not found' });
+      console.warn(`Import ${trimmedName}: worlds directory not found (server probably never started), continuing`);
     }
 
-    // Get server name and version from the source
-    let serverName = details.Config.Env?.find(env => env.startsWith('SERVER_NAME='))?.split('=')[1] || trimmedName;
-    let serverVersion = details.Config.Env?.find(env => env.startsWith('VERSION='))?.split('=')[1] || 'LATEST';
+    // Get server name and version (manager metadata if present, otherwise from the container env)
+    let srcMeta = {};
+    try { srcMeta = await fs.readJson(path.join(sourceDataPath, 'metadata.json')); } catch (e) {}
+    const envVal = (k) => {
+      const e = env.find(x => x.startsWith(k + '='));
+      return e ? e.slice(k.length + 1) : undefined;
+    };
+    const serverName = srcMeta.name || envVal('SERVER_NAME') || trimmedName;
+    const serverVersion = srcMeta.version || envVal('VERSION') || 'LATEST';
 
-    // Create new server
+    // Detect the connection model of the source container (exposed ports + version)
+    const mig = analyzeMigration(details, serverVersion, migrate);
+
+    // Validate the requested port BEFORE anything is stopped / copied
+    let requestedPort = null;
+    if (port) {
+      requestedPort = parseInt(port, 10);
+      if (isNaN(requestedPort) || requestedPort < 1 || requestedPort > 65535) {
+        return res.status(400).json({ error: 'Invalid port number' });
+      }
+      // the source container's own port becomes free once that container is stopped
+      if (requestedPort !== mig.origHostPort && !(await isPortAvailable(requestedPort))) {
+        return res.status(400).json({ error: `Port ${requestedPort} is already in use` });
+      }
+    }
+
+    const migrationInfo = (udpStart, inPlace) => ({
+      originalModel: mig.legacyRaknet ? 'RakNet (UDP only)' : 'NetherNet-ready (TCP + UDP)',
+      originalPort: mig.origHostPort,
+      convertedToNethernet: mig.convert,
+      inPlace,
+      reason: mig.reason,
+      udpPorts: [udpStart, udpStart + UDP_PORTS_PER_SERVER - 1]
+    });
+
+    // ===== Server created by this manager: convert in place (no data copy) =====
+    if (managedId) {
+      const serverId = managedId;
+      const serverPath = getServerPath(serverId);
+      const wasRunning = !!details.State?.Running;
+
+      const gamePort = requestedPort || mig.origHostPort || await findAvailablePort(19132);
+
+      if (mig.convert) await setTransport(serverPath, 'nethernet');
+      else if (mig.keepRaknet) await setTransport(serverPath, 'raknet');
+
+      const metadataPath = path.join(serverPath, 'metadata.json');
+      const metadata = { ...srcMeta };
+      metadata.name = metadata.name || serverName;
+      metadata.version = metadata.version || serverVersion;
+      metadata.memory = metadata.memory || details.HostConfig?.Memory || 2 * 1024 * 1024 * 1024;
+      metadata.createdAt = metadata.createdAt || new Date().toISOString();
+      metadata.updatedAt = new Date().toISOString();
+
+      if (wasRunning) {
+        try { await container.stop(); } catch (stopErr) { console.warn(`Failed to stop ${trimmedName}:`, stopErr.message); }
+      }
+      await container.remove();
+
+      const udpStart = await getUdpStart(serverId, metadata);
+      const newContainer = await docker.createContainer(buildContainerConfig({
+        serverId, name: metadata.name, version: metadata.version, memory: metadata.memory,
+        gamePort, udpStart, hostServerPath: hostSource
+      }));
+      if (wasRunning) await newContainer.start();
+
+      const newInfo = await newContainer.inspect();
+      metadata.containerName = newInfo.Name ? newInfo.Name.replace('/', '') : serverId;
+      await fs.writeJson(metadataPath, metadata, { spaces: 2 });
+      invalidateFileCache(metadataPath);
+      invalidateServerCache(serverId);
+
+      console.log(`Converted managed server ${serverId} in place -> ${mig.reason}`);
+      setTimeout(() => broadcastServerUpdate(serverId), 2000);
+
+      return res.json({
+        id: serverId,
+        name: metadata.name,
+        version: metadata.version,
+        gamePort,
+        migration: migrationInfo(udpStart, true),
+        message: 'Existing managed server converted in place'
+      });
+    }
+
+    // ===== External container: copy data into a new server =====
     const serverId = `bedrock-${Date.now()}`;
     const serverPath = getServerPath(serverId);
-    const hostDataPath = await getHostDataPath();
     const hostServerPath = path.join(hostDataPath, serverId);
 
     // Create server directory
@@ -530,21 +919,19 @@ app.post('/api/servers/import', async (req, res) => {
     metadata.createdAt = new Date().toISOString();
     metadata.updatedAt = new Date().toISOString();
     metadata.importedFrom = trimmedName;
+    delete metadata.udpStart;   // don't inherit the UDP block from the copied data; allocate a new one
     await fs.writeJson(metadataPath, metadata, { spaces: 2 });
 
-    // Find available port or use requested one
-    let gamePort;
-    if (port) {
-      const requestedPort = parseInt(port);
-      if (isNaN(requestedPort) || requestedPort < 1 || requestedPort > 65535) {
-        return res.status(400).json({ error: 'Invalid port number' });
-      }
-      if (!(await isPortAvailable(requestedPort))) {
-        return res.status(400).json({ error: `Port ${requestedPort} is already in use` });
-      }
-      gamePort = requestedPort;
-    } else {
-      gamePort = await findAvailablePort(19132);
+    if (mig.convert) await setTransport(serverPath, 'nethernet');
+    else if (mig.keepRaknet) await setTransport(serverPath, 'raknet');   // so the UI label is correct
+    console.log(`Import ${trimmedName}: ports=[${mig.keys.join(', ')}] version=${serverVersion} -> ${mig.reason}`);
+
+    // Port: the one requested by the user, otherwise reuse the original host port (so proxy/VPS rules still match)
+    let gamePort = requestedPort;
+    if (!gamePort) {
+      gamePort = (mig.origHostPort && await isPortAvailable(mig.origHostPort))
+        ? mig.origHostPort
+        : await findAvailablePort(19132);
     }
 
     // Pull the Docker image if not available
@@ -564,29 +951,7 @@ app.post('/api/servers/import', async (req, res) => {
     }
 
     // Create new container
-    const newContainer = await docker.createContainer({
-      Image: BEDROCK_IMAGE,
-      name: serverId,
-      Labels: {
-        'server-id': serverId,
-        'server-name': serverName
-      },
-      Env: [
-        'EULA=TRUE',
-        'VERSION=' + serverVersion,
-        'SERVER_NAME=' + serverName
-      ],
-      HostConfig: {
-        Binds: [`${hostServerPath}:/data`],
-        PortBindings: {
-          '19132/udp': [{ HostPort: gamePort.toString() }]
-        },
-        RestartPolicy: {
-          Name: 'unless-stopped'
-        },
-        Memory: metadata.memory
-      }
-    });
+    const newContainer = await docker.createContainer(buildContainerConfig({ serverId, name: serverName, version: serverVersion, memory: metadata.memory, gamePort, udpStart: await getUdpStart(serverId, metadata), hostServerPath }));
 
     // Start the new container
     await newContainer.start();
@@ -610,6 +975,7 @@ app.post('/api/servers/import', async (req, res) => {
       name: serverName,
       version: serverVersion,
       gamePort,
+      migration: migrationInfo(metadata.udpStart, false),
       message: 'Server imported successfully'
     });
   } catch (err) {
@@ -673,31 +1039,26 @@ app.post('/api/servers', async (req, res) => {
     }
 
     // Create container
-    const container = await docker.createContainer({
-      Image: BEDROCK_IMAGE,
-      name: serverId,
-      Labels: {
-        'server-id': serverId,
-        'server-name': name
-      },
-      Env: [
-        'EULA=TRUE',
-        'VERSION=' + version,
-        'SERVER_NAME=' + name
-      ],
-      HostConfig: {
-        Binds: [`${hostServerPath}:/data`],
-        PortBindings: {
-          '19132/udp': [{ HostPort: gamePort.toString() }]
-        },
-        RestartPolicy: {
-          Name: 'unless-stopped'
-        },
-        Memory: metadata.memory
-      }
-    });
+    const container = await docker.createContainer(buildContainerConfig({ serverId, name, version, memory: metadata.memory, gamePort, udpStart: await getUdpStart(serverId, metadata), hostServerPath }));
 
     await container.start();
+
+    // NetherNet: server.properties is only created on the first start.
+    // Patch in the background (transport + server-udp-ports), then restart so it takes effect.
+    (async () => {
+      try {
+        if (await waitForFile(path.join(serverPath, 'server.properties'))) {
+          await applyNethernetProps(serverPath, metadata.udpStart);
+          await container.restart();
+          invalidateServerCache(serverId);
+          setTimeout(() => broadcastServerUpdate(serverId), 5000);
+        } else {
+          console.warn(`server.properties not found for ${serverId}, NetherNet props not applied`);
+        }
+      } catch (e) {
+        console.error('NetherNet setup failed:', e);
+      }
+    })();
 
     // Update metadata with actual container name
     const containerInfo = await container.inspect();
@@ -788,29 +1149,7 @@ app.post('/api/servers/:id/start', async (req, res) => {
         // Get memory from metadata
         let memory = metadata.memory || 2 * 1024 * 1024 * 1024; // default 2GB
 
-        const newContainer = await docker.createContainer({
-          Image: BEDROCK_IMAGE,
-          name: serverId,
-          Labels: {
-            'server-id': serverId,
-            'server-name': metadata.name || serverId
-          },
-          Env: [
-            'EULA=TRUE',
-            'VERSION=' + (metadata.version || 'LATEST'),
-            'SERVER_NAME=' + (metadata.name || serverId)
-          ],
-          HostConfig: {
-            Binds: [`${hostServerPath}:/data`],
-            PortBindings: {
-              '19132/udp': [{ HostPort: newGamePort.toString() }]
-            },
-            RestartPolicy: {
-              Name: 'unless-stopped'
-            },
-            Memory: memory
-          }
-        });
+        const newContainer = await docker.createContainer(buildContainerConfig({ serverId, name: metadata.name || serverId, version: metadata.version || 'LATEST', memory, gamePort: newGamePort, udpStart: await getUdpStart(serverId, metadata), hostServerPath }));
 
         // Start the new container
         await newContainer.start();
@@ -948,29 +1287,7 @@ app.post('/api/servers/:id/rename', async (req, res) => {
     }
 
     // Create new container with updated server name
-    const newContainer = await docker.createContainer({
-      Image: BEDROCK_IMAGE,
-      name: serverId,
-      Labels: {
-        'server-id': serverId,
-        'server-name': name.trim()
-      },
-      Env: [
-        'EULA=TRUE',
-        'VERSION=' + (metadata.version || 'LATEST'),
-        'SERVER_NAME=' + name.trim()
-      ],
-      HostConfig: {
-        Binds: [`${hostServerPath}:/data`],
-        PortBindings: {
-          '19132/udp': [{ HostPort: gamePort.toString() }]
-        },
-        RestartPolicy: {
-          Name: 'unless-stopped'
-        },
-        Memory: memory
-      }
-    });
+    const newContainer = await docker.createContainer(buildContainerConfig({ serverId, name: name.trim(), version: metadata.version || 'LATEST', memory, gamePort, udpStart: await getUdpStart(serverId, metadata), hostServerPath }));
 
     // Start container if it was running before
     if (wasRunning) {
@@ -1055,29 +1372,7 @@ app.post('/api/servers/:id/version', async (req, res) => {
     const hostServerPath = path.join(hostDataPath, serverId);
 
     // Create new container with updated version
-    const newContainer = await docker.createContainer({
-      Image: BEDROCK_IMAGE,
-      name: serverId,
-      Labels: {
-        'server-id': serverId,
-        'server-name': metadata.name
-      },
-      Env: [
-        'EULA=TRUE',
-        'VERSION=' + version.trim(),
-        'SERVER_NAME=' + metadata.name
-      ],
-      HostConfig: {
-        Binds: [`${hostServerPath}:/data`],
-        PortBindings: {
-          '19132/udp': [{ HostPort: gamePort.toString() }]
-        },
-        RestartPolicy: {
-          Name: 'unless-stopped'
-        },
-        Memory: memory
-      }
-    });
+    const newContainer = await docker.createContainer(buildContainerConfig({ serverId, name: metadata.name, version: version.trim(), memory, gamePort, udpStart: await getUdpStart(serverId, metadata), hostServerPath }));
 
     // Start container if it was running before
     if (wasRunning) {
@@ -1176,29 +1471,7 @@ app.put('/api/servers/:id/memory', async (req, res) => {
     }
 
     // Create new container with updated memory
-    const newContainer = await docker.createContainer({
-      Image: BEDROCK_IMAGE,
-      name: serverId,
-      Labels: {
-        'server-id': serverId,
-        'server-name': metadata.name
-      },
-      Env: [
-        'EULA=TRUE',
-        'VERSION=' + (metadata.version || 'LATEST'),
-        'SERVER_NAME=' + metadata.name
-      ],
-      HostConfig: {
-        Binds: [`${hostServerPath}:/data`],
-        PortBindings: {
-          '19132/udp': [{ HostPort: gamePort.toString() }]
-        },
-        RestartPolicy: {
-          Name: 'unless-stopped'
-        },
-        Memory: memoryBytes
-      }
-    });
+    const newContainer = await docker.createContainer(buildContainerConfig({ serverId, name: metadata.name, version: metadata.version || 'LATEST', memory: memoryBytes, gamePort, udpStart: await getUdpStart(serverId, metadata), hostServerPath }));
 
     // Start container if it was running before
     if (wasRunning) {
@@ -1234,15 +1507,16 @@ app.put('/api/servers/:id/memory', async (req, res) => {
 // PUT /api/servers/:id/port - Update server port
 app.put('/api/servers/:id/port', async (req, res) => {
   try {
-    const { port } = req.body;
+    const { port, udpStart: udpStartInput } = req.body;
     const requestedPort = parseInt(port);
 
     if (!port || isNaN(requestedPort) || requestedPort < 1 || requestedPort > 65535) {
       return res.status(400).json({ error: 'Valid port number is required' });
     }
 
-    if (!(await isPortAvailable(requestedPort))) {
-      return res.status(400).json({ error: `Port ${requestedPort} is already in use` });
+    let manualUdpStart;
+    if (udpStartInput !== undefined && udpStartInput !== null && udpStartInput !== '') {
+      manualUdpStart = parseInt(udpStartInput, 10);
     }
 
     const serverId = req.params.id;
@@ -1259,6 +1533,16 @@ app.put('/api/servers/:id/port', async (req, res) => {
     const containerInfo = await container.inspect();
     const wasRunning = containerInfo.State.Running;
 
+    // The same port as the current one is allowed (e.g. only changing the UDP block)
+    const currentHostPort = parseInt(containerInfo.HostConfig?.PortBindings?.['19132/udp']?.[0]?.HostPort, 10);
+    if (requestedPort !== currentHostPort && !(await isPortAvailable(requestedPort))) {
+      return res.status(400).json({ error: `Port ${requestedPort} is already in use` });
+    }
+    if (manualUdpStart !== undefined) {
+      const udpErr = await validateUdpStart(serverId, manualUdpStart, requestedPort);
+      if (udpErr) return res.status(400).json({ error: udpErr });
+    }
+
     // Read metadata to preserve settings
     const metadataPath = path.join(serverPath, 'metadata.json');
     let metadata = {};
@@ -1272,30 +1556,15 @@ app.put('/api/servers/:id/port', async (req, res) => {
     }
     await container.remove();
 
+    // Manual UDP block (optional); if not provided, the existing block is kept
+    if (manualUdpStart !== undefined) {
+      metadata.udpStart = manualUdpStart;
+      await fs.writeJson(metadataPath, metadata, { spaces: 2 });
+      invalidateFileCache(metadataPath);
+    }
+
     // Create new container with NEW PORT
-    const newContainer = await docker.createContainer({
-      Image: BEDROCK_IMAGE,
-      name: serverId,
-      Labels: {
-        'server-id': serverId,
-        'server-name': metadata.name || serverId
-      },
-      Env: [
-        'EULA=TRUE',
-        'VERSION=' + (metadata.version || 'LATEST'),
-        'SERVER_NAME=' + (metadata.name || serverId)
-      ],
-      HostConfig: {
-        Binds: [`${hostServerPath}:/data`],
-        PortBindings: {
-          '19132/udp': [{ HostPort: requestedPort.toString() }]
-        },
-        RestartPolicy: {
-          Name: 'unless-stopped'
-        },
-        Memory: metadata.memory || 2 * 1024 * 1024 * 1024
-      }
-    });
+    const newContainer = await docker.createContainer(buildContainerConfig({ serverId, name: metadata.name || serverId, version: metadata.version || 'LATEST', memory: metadata.memory || 2 * 1024 * 1024 * 1024, gamePort: requestedPort, udpStart: await getUdpStart(serverId, metadata), hostServerPath }));
 
     // Start if it was running
     if (wasRunning) {
@@ -1313,6 +1582,7 @@ app.put('/api/servers/:id/port', async (req, res) => {
     res.json({
       message: 'Server port updated successfully',
       gamePort: requestedPort,
+      udpPorts: [metadata.udpStart, metadata.udpStart + UDP_PORTS_PER_SERVER - 1],
       restarted: wasRunning
     });
   } catch (err) {
@@ -2105,6 +2375,119 @@ app.put('/api/servers/:id/transport', async (req, res) => {
 
     res.json({ message: 'Transport updated', transport, restarted });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/settings - Manager settings (NetherNet public IP + WireGuard params)
+app.get('/api/settings', async (req, res) => {
+  try {
+    const wg = await getWgSettings();
+    res.json({
+      publicIp: await getPublicIp(),
+      udpRangeBase: UDP_RANGE_BASE,
+      udpPortsPerServer: UDP_PORTS_PER_SERVER,
+      wgPublicIface: wg.publicIface,
+      wgInterface: wg.wgInterface,
+      wgHomeIp: wg.homeIp
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/settings - Partial update. publicIp (optionally rewrite server.properties + restart) and/or WireGuard params
+app.put('/api/settings', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const settings = await readSettings();
+    const ifaceRe = /^[A-Za-z0-9_.-]{1,15}$/;
+
+    if (body.publicIp !== undefined) {
+      const publicIp = String(body.publicIp || '').trim();
+      if (publicIp && !net.isIPv4(publicIp)) {
+        return res.status(400).json({ error: 'Public IP must be an IPv4 address (e.g. 203.0.113.5), not a hostname' });
+      }
+      settings.publicIp = publicIp;
+    }
+    for (const [field, key] of [['wgPublicIface', 'wgPublicIface'], ['wgInterface', 'wgInterface']]) {
+      if (body[field] !== undefined) {
+        const v = String(body[field] || '').trim();
+        if (!ifaceRe.test(v)) return res.status(400).json({ error: `Invalid interface name for ${field}` });
+        settings[key] = v;
+      }
+    }
+    if (body.wgHomeIp !== undefined) {
+      const v = String(body.wgHomeIp || '').trim();
+      if (!net.isIPv4(v)) return res.status(400).json({ error: 'WireGuard home IP must be an IPv4 address (e.g. 10.8.0.2)' });
+      settings.wgHomeIp = v;
+    }
+    await writeSettings(settings);
+
+    const updated = [];
+    const restarted = [];
+    if (body.publicIp !== undefined && body.apply !== false) {
+      for (const id of await fs.readdir(DATA_DIR)) {
+        try {
+          const serverPath = getServerPath(id);
+          const m = await fs.readJson(path.join(serverPath, 'metadata.json'));
+          if (!m.udpStart) continue;
+          if (!await fs.pathExists(path.join(serverPath, 'server.properties'))) continue;
+          await applyNethernetProps(serverPath, m.udpStart);
+          updated.push(id);
+
+          if (body.restart) {
+            const container = await getContainer(id);
+            if (container) {
+              const info = await container.inspect();
+              if (info.State.Running) {
+                await container.restart();
+                restarted.push(id);
+              }
+            }
+          }
+        } catch (e) {
+          // skip entries that are not servers
+        }
+      }
+      invalidateServerCache();
+      setTimeout(() => broadcastServerUpdate(), restarted.length ? 5000 : 500);
+    }
+
+    res.json({ message: 'Settings saved', publicIp: await getPublicIp(), updated, restarted });
+  } catch (err) {
+    console.error('Error saving settings:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/wireguard - Generate PostUp/PostDown (VPS) from the ports published by all servers
+app.get('/api/wireguard', async (req, res) => {
+  try {
+    const saved = await getWgSettings();
+    const ifaceRe = /^[A-Za-z0-9_.-]{1,15}$/;
+    const publicIface = String(req.query.publicIface || saved.publicIface).trim();
+    const wgInterface = String(req.query.wgInterface || saved.wgInterface).trim();
+    const homeIp = String(req.query.homeIp || saved.homeIp).trim();
+    if (!ifaceRe.test(publicIface) || !ifaceRe.test(wgInterface)) {
+      return res.status(400).json({ error: 'Invalid interface name' });
+    }
+    if (!net.isIPv4(homeIp)) {
+      return res.status(400).json({ error: 'Home IP must be an IPv4 address (e.g. 10.8.0.2)' });
+    }
+
+    const { tcpRanges, udpRanges, servers } = await collectPublishedPorts();
+    const { text, ufw } = buildWireguardRules({ publicIface, wgInterface, homeIp, tcpRanges, udpRanges });
+    const fmt = ([a, b]) => (a === b ? `${a}` : `${a}-${b}`);
+    res.json({
+      text,
+      ufw,
+      tcp: tcpRanges.map(fmt),
+      udp: udpRanges.map(fmt),
+      servers: servers.map(x => ({ id: x.id, name: x.name, tcp: x.tcp, udp: x.udp.length }))
+    });
+  } catch (err) {
+    console.error('Error generating WireGuard rules:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -3334,6 +3717,8 @@ server.listen(PORT, async () => {
   console.log(`- Lockout duration: ${process.env.LOGIN_LOCKOUT_MINUTES || 5} minutes`);
   console.log(`- Session timeout: 24 hours (hardcoded)`);
   console.log(`Data directory: ${DATA_DIR}`);
+  const startupIp = await getPublicIp();
+  console.log(`NetherNet public IP: ${startupIp || '[NOT SET - set it with the Public IP button in the UI so clients outside the Docker network can connect]'}`);
   console.log(`Temp directory: ./temp/`);
   console.log(`WebSocket server ready for real-time updates`);
 });
