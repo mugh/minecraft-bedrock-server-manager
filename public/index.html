@@ -278,6 +278,10 @@
                 <label class="block text-sm text-gray-400 mb-2">Container Name</label>
                 <input type="text" id="importContainerName" placeholder="e.g. my-bedrock-server" class="w-full px-3 py-1.5 text-sm bg-gray-900 border border-gray-700 rounded-lg">
             </div>
+            <label class="flex items-start gap-2 text-sm text-gray-300 mb-3">
+                <input type="checkbox" id="importMigrate" checked class="mt-1">
+                <span>Convert to NetherNet if the original exposes UDP only (RakNet). Versions older than 1.26.30 stay on RakNet.</span>
+            </label>
             <div class="text-xs text-gray-500 mb-3">
                 <p>💡 Import an existing itzg/minecraft-bedrock-server container to manage it with this interface.</p>
                 <p>The container must be running and contain valid Minecraft Bedrock server data.</p>
@@ -2289,6 +2293,42 @@
         }
 
         // Render functions
+        // Per-server port info for the server list:
+        //  - NetherNet: TCP port (handshake) + UDP gameplay range
+        //  - RakNet   : UDP port only
+        function getPortInfo(server) {
+            const ports = server.ports || [];
+            const find = (type) => ports.find(p => p.PrivatePort === 19132 && p.Type === type)?.PublicPort;
+            const tcp = find('tcp');
+            const udp = find('udp');
+            const transport = (server.transport || 'nethernet').toLowerCase();
+
+            // NetherNet UDP block: from metadata (udpStart), or from published UDP ports other than 19132
+            let udpRange = null;
+            if (server.udpStart) {
+                udpRange = [server.udpStart, server.udpStart + 15];
+            } else {
+                const extra = ports.filter(p => p.Type === 'udp' && p.PrivatePort !== 19132).map(p => p.PublicPort).sort((a, b) => a - b);
+                if (extra.length) udpRange = [extra[0], extra[extra.length - 1]];
+            }
+            return { transport, tcp, udp, udpRange, game: tcp || udp || 19132 };
+        }
+
+        function renderPortLines(server) {
+            const i = getPortInfo(server);
+            const cls = 'text-xs text-white-400';
+            if (i.transport === 'raknet') {
+                return `<div class="${cls}" title="RakNet: UDP only">Port: ${i.udp || i.game} (UDP)</div>`;
+            }
+            // Labeled NetherNet but the container doesn't expose TCP / a UDP block yet (older server): flag it
+            if (!i.tcp && !i.udpRange) {
+                return `<div class="${cls}" title="Container still exposes UDP only (RakNet style). Recreate it (Import / Rename) to expose NetherNet ports.">Port: ${i.udp || i.game} (UDP) ⚠️</div>`;
+            }
+            const range = i.udpRange ? `${i.udpRange[0]}-${i.udpRange[1]}` : '-';
+            return `<div class="${cls}" title="NetherNet: TCP for handshake">Port: ${i.tcp || '-'} (TCP)</div>` +
+                   `<div class="${cls}" title="NetherNet: UDP block for gameplay">UDP: ${range}</div>`;
+        }
+
         function renderSidebar() {
             const sidebar = document.getElementById('sidebar');
             if (sidebar) {
@@ -2306,7 +2346,7 @@
                                 <div class="flex items-center justify-between">
                                     <div>
                                         <div class="font-medium truncate">${server.name}</div>
-                                        ${server.status === 'running' ? `<div class="text-xs text-white-400">Port: ${server.ports?.find(p => p.PrivatePort === 19132)?.PublicPort || '19132'}</div>` : ''}
+                                        ${server.status === 'running' ? renderPortLines(server) : ''}
                                     </div>
                                     <span class="status-dot ${server.status === 'running' ? 'bg-green-500' : 'bg-red-500'}"></span>
                                 </div>
@@ -2360,6 +2400,14 @@
                                 <span class="hidden sm:inline">📥 Import</span>
                                 <span class="sm:hidden">📥</span>
                             </button>
+                            <button onclick="showPublicIp()" class="px-2 md:px-3 py-1.5 text-xs md:text-sm bg-gray-700 hover:bg-gray-600 rounded-lg" title="Public IP">
+                                <span class="hidden sm:inline">🌐 Public IP</span>
+                                <span class="sm:hidden">🌐</span>
+                            </button>
+                            <button onclick="showWireguard()" class="px-2 md:px-3 py-1.5 text-xs md:text-sm bg-gray-700 hover:bg-gray-600 rounded-lg" title="WireGuard rules">
+                                <span class="hidden sm:inline">🛡️ WireGuard</span>
+                                <span class="sm:hidden">🛡️</span>
+                            </button>
                         </div>
                     </div>
                 </div>
@@ -2384,7 +2432,7 @@
                                     <div class="flex items-center justify-between">
                                         <div>
                                             <div class="font-medium truncate">${server.name}</div>
-                                            ${server.status === 'running' ? `<div class="text-xs text-white-400">Port: ${server.ports?.find(p => p.PrivatePort === 19132)?.PublicPort || '19132'}</div>` : ''}
+                                            ${server.status === 'running' ? renderPortLines(server) : ''}
                                         </div>
                                         <span class="status-dot ${server.status === 'running' ? 'bg-green-500' : 'bg-red-500'}"></span>
                                     </div>
@@ -2418,7 +2466,13 @@
                                             </button>
                                         </div>
                                         <div class="text-xs text-gray-400 mt-0.5 truncate">
-                                            ${currentServer.status} • ${currentServer.worldSize}
+                                            ${currentServer.status} • ${currentServer.worldSize}${(() => {
+                                                if (currentServer.status !== 'running') return '';
+                                                const i = getPortInfo(currentServer);
+                                                if (i.transport === 'raknet') return ` • UDP ${i.udp || i.game}`;
+                                                if (!i.tcp && !i.udpRange) return ` • UDP ${i.udp || i.game} ⚠️`;
+                                                return ` • TCP ${i.tcp || '-'} • UDP ${i.udpRange ? i.udpRange[0] + '-' + i.udpRange[1] : '-'}`;
+                                            })()}
                                         </div>
                                     </div>
                                     <div class="flex gap-1.5 flex-wrap">
@@ -2469,44 +2523,76 @@
             const currentServer = state.servers.find(s => s.id === state.selectedServer);
             if (!currentServer) return;
 
-            const { value: port } = await Swal.fire({
+            const curPort = currentServer.ports?.find(p => p.PrivatePort === 19132)?.PublicPort || 19132;
+            const curUdp = currentServer.udpStart;
+            const udpHint = curUdp ? ('auto, now ' + curUdp + '-' + (curUdp + 15)) : 'auto';
+
+            const result = await Swal.fire({
                 title: 'Change Server Port',
-                input: 'number',
-                inputLabel: 'Enter new port number',
-                inputValue: currentServer.ports?.find(p => p.PrivatePort === 19132)?.PublicPort || 19132,
+                html: `
+                    <div class="text-left text-sm">
+                        <label class="block text-sm font-medium text-gray-300 mb-1">Game port</label>
+                        <input id="swal-game-port" type="number" value="${curPort}" class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white">
+                        <p class="text-xs text-gray-400 mt-1">Changes the <b>TCP</b> port (NetherNet handshake) and the <b>UDP</b> port (RakNet) together. Both always use the same number.</p>
+                        <label class="block text-sm font-medium text-gray-300 mt-3 mb-1">NetherNet UDP block start <span class="text-gray-400">(optional)</span></label>
+                        <input id="swal-udp-start" type="number" placeholder="${udpHint}" class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white">
+                        <p class="text-xs text-gray-400 mt-1">16 UDP ports used for NetherNet gameplay. Leave empty to keep the current block (recommended). Fill it in only if you want to choose it yourself, e.g. to match your WireGuard/proxy rules.</p>
+                    </div>
+                `,
                 showCancelButton: true,
                 confirmButtonColor: '#10b981',
                 cancelButtonColor: '#6b7280',
-                inputValidator: (value) => {
-                    if (!value || value < 1024 || value > 65535) {
-                        return 'Please enter a valid port number (1024-65535)';
+                preConfirm: () => {
+                    const port = parseInt(document.getElementById('swal-game-port').value, 10);
+                    const udpRaw = document.getElementById('swal-udp-start').value.trim();
+                    if (!port || port < 1024 || port > 65535) {
+                        Swal.showValidationMessage('Please enter a valid port number (1024-65535)');
+                        return false;
                     }
+                    let udpStart;
+                    if (udpRaw !== '') {
+                        udpStart = parseInt(udpRaw, 10);
+                        if (!udpStart || udpStart < 1024 || udpStart > 65535 - 15) {
+                            Swal.showValidationMessage('UDP block start must be between 1024 and 65520');
+                            return false;
+                        }
+                    }
+                    return { port, udpStart };
                 }
             });
 
-            if (!port) return;
+            if (!result.isConfirmed || !result.value) return;
+            const { port, udpStart } = result.value;
 
             try {
                 showLoading();
+                const body = { port };
+                if (udpStart !== undefined) body.udpStart = udpStart;
                 const response = await fetch(`${API_BASE}/servers/${state.selectedServer}/port`, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ port: parseInt(port) })
+                    body: JSON.stringify(body)
                 });
 
                 if (response.ok) {
+                    const data = await response.json();
                     await fetchServers();
                     hideLoading();
+                    const udpRange = data.udpPorts ? (data.udpPorts[0] + '-' + data.udpPorts[1]) : '-';
                     Swal.fire({
                         title: 'Success',
-                        text: 'Server port updated successfully! The server needs to be restarted for the change to take effect.',
+                        html: '<div class="text-left text-sm">' +
+                            '<div>Game port (TCP + UDP): <b>' + data.gamePort + '</b></div>' +
+                            '<div>NetherNet UDP block: <b>' + udpRange + '</b></div>' +
+                            '<div class="text-xs text-gray-400 mt-2">If the port changed, update your proxy/WireGuard rules with the 🛡️ WireGuard button. The server must be restarted for the change to take effect.</div>' +
+                            '</div>',
                         icon: 'success',
                         confirmButtonColor: '#10b981'
                     });
                 } else {
-                    const result = await response.json();
+                    const err = await response.json();
                     hideLoading();
-                    throw new Error(result.error || 'Failed to update port');
+                    throw new Error(err.error || 'Failed to update port');
                 }
             } catch (err) {
                 hideLoading();
@@ -2577,6 +2663,169 @@
                 Swal.fire({
                     title: 'Error',
                     text: 'Failed to update transport: ' + err.message,
+                    icon: 'error',
+                    confirmButtonColor: '#10b981'
+                });
+            }
+        }
+
+        async function refreshWireguard() {
+            const out = document.getElementById('wg-out');
+            const ufw = document.getElementById('wg-ufw');
+            const sum = document.getElementById('wg-summary');
+            if (!out) return;
+            try {
+                const q = new URLSearchParams({
+                    publicIface: document.getElementById('wg-public-iface').value.trim(),
+                    wgInterface: document.getElementById('wg-iface').value.trim(),
+                    homeIp: document.getElementById('wg-home-ip').value.trim()
+                });
+                const r = await fetch(`${API_BASE}/wireguard?${q}`);
+                const d = await r.json();
+                if (!r.ok) throw new Error(d.error || 'Failed to generate');
+                out.value = d.text;
+                ufw.value = d.ufw;
+                sum.textContent = 'TCP: ' + (d.tcp.join(', ') || '-') + '  |  UDP: ' + (d.udp.join(', ') || '-') + '  |  ' + d.servers.length + ' server';
+            } catch (e) {
+                out.value = 'Error: ' + e.message;
+                ufw.value = '';
+                sum.textContent = '';
+            }
+        }
+
+        function copyWireguard(id) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            const done = () => Swal.showValidationMessage('Copied');
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(el.value).then(done).catch(() => { el.select(); document.execCommand('copy'); done(); });
+            } else {
+                el.select();
+                document.execCommand('copy');
+                done();
+            }
+        }
+
+        async function showWireguard() {
+            let cur = { wgPublicIface: 'eth0', wgInterface: 'wg0', wgHomeIp: '10.8.0.2' };
+            try {
+                const r = await fetch(`${API_BASE}/settings`);
+                if (r.ok) cur = await r.json();
+            } catch (e) {}
+
+            const inputCls = 'w-full px-2 py-1.5 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm';
+            const areaCls = 'w-full px-2 py-1.5 bg-gray-900 border border-gray-600 rounded-lg text-green-300 text-xs font-mono';
+            const result = await Swal.fire({
+                title: 'WireGuard rules (VPS)',
+                width: 820,
+                html: `
+                    <div class="text-left text-sm">
+                        <div class="grid grid-cols-3 gap-2 mb-2">
+                            <div><label class="block text-xs text-gray-400 mb-1">VPS public interface</label><input id="wg-public-iface" class="${inputCls}" value="${cur.wgPublicIface}" onchange="refreshWireguard()"></div>
+                            <div><label class="block text-xs text-gray-400 mb-1">WireGuard interface</label><input id="wg-iface" class="${inputCls}" value="${cur.wgInterface}" onchange="refreshWireguard()"></div>
+                            <div><label class="block text-xs text-gray-400 mb-1">Home tunnel IP</label><input id="wg-home-ip" class="${inputCls}" value="${cur.wgHomeIp}" onchange="refreshWireguard()"></div>
+                        </div>
+                        <div id="wg-summary" class="text-xs text-gray-400 mb-2"></div>
+                        <div class="flex items-center justify-between mb-1">
+                            <span class="text-xs text-gray-300">Replace all <code>PostUp</code>/<code>PostDown</code> lines in the VPS <code>[Interface]</code> section:</span>
+                            <button type="button" onclick="copyWireguard('wg-out')" class="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 rounded">Copy</button>
+                        </div>
+                        <textarea id="wg-out" rows="12" readonly class="${areaCls}"></textarea>
+                        <div class="flex items-center justify-between mt-2 mb-1">
+                            <span class="text-xs text-gray-300">Firewall (ufw) on the VPS:</span>
+                            <button type="button" onclick="copyWireguard('wg-ufw')" class="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 rounded">Copy</button>
+                        </div>
+                        <textarea id="wg-ufw" rows="3" readonly class="${areaCls}"></textarea>
+                        <p class="text-xs text-yellow-400 mt-2">⚠️ Apply in this order: run <code>wg-quick down ${cur.wgInterface || 'wg0'}</code> first (so the old PostDown removes the old rules), then edit the file, then run <code>wg-quick up ${cur.wgInterface || 'wg0'}</code>. If the file is edited while the tunnel is up, the old rules are left behind.</p>
+                    </div>
+                `,
+                showCancelButton: true,
+                confirmButtonText: 'Save settings',
+                cancelButtonText: 'Close',
+                confirmButtonColor: '#10b981',
+                cancelButtonColor: '#6b7280',
+                didOpen: () => { refreshWireguard(); },
+                preConfirm: () => ({
+                    wgPublicIface: document.getElementById('wg-public-iface').value.trim(),
+                    wgInterface: document.getElementById('wg-iface').value.trim(),
+                    wgHomeIp: document.getElementById('wg-home-ip').value.trim()
+                })
+            });
+
+            if (!result.isConfirmed) return;
+            try {
+                const response = await fetch(`${API_BASE}/settings`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(result.value)
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || 'Failed to save');
+                Swal.fire({ title: 'Saved', icon: 'success', timer: 1200, showConfirmButton: false });
+            } catch (err) {
+                Swal.fire({ title: 'Error', text: err.message, icon: 'error', confirmButtonColor: '#10b981' });
+            }
+        }
+
+        async function showPublicIp() {
+            let current = { publicIp: '' };
+            try {
+                const r = await fetch(`${API_BASE}/settings`);
+                if (r.ok) current = await r.json();
+            } catch (e) {}
+
+            const result = await Swal.fire({
+                title: 'Public IP',
+                html: `
+                    <div class="text-left text-sm">
+                        <label class="block text-sm font-medium text-gray-300 mb-2">Public IP (NetherNet)</label>
+                        <input id="swal-public-ip" type="text" value="${current.publicIp || ''}" placeholder="e.g. 203.0.113.5" class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500 text-white">
+                        <p class="text-xs text-gray-400 mt-2">IPv4 address the server advertises to clients for the UDP gameplay path (not a hostname). If the server is behind a VPS/reverse proxy, enter the VPS public IP.</p>
+                        <p class="text-xs text-gray-400 mt-2">Ports that must be forwarded: the server's <b>TCP</b> game port, and <b>UDP ${current.udpRangeBase || 20000}+</b> (${current.udpPortsPerServer || 16} ports per server, same port numbers on the VPS and on the server).</p>
+                        <label class="flex items-center mt-3">
+                            <input id="swal-apply-restart" type="checkbox" checked class="mr-2">
+                            <span class="text-sm">Apply to all servers &amp; restart the running ones</span>
+                        </label>
+                    </div>
+                `,
+                showCancelButton: true,
+                confirmButtonText: 'Save',
+                confirmButtonColor: '#10b981',
+                cancelButtonColor: '#6b7280',
+                preConfirm: () => ({
+                    publicIp: document.getElementById('swal-public-ip').value.trim(),
+                    restart: document.getElementById('swal-apply-restart').checked
+                })
+            });
+
+            if (!result.isConfirmed) return;
+
+            try {
+                showLoading();
+                const response = await fetch(`${API_BASE}/settings`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(result.value)
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || 'Failed to save Public IP');
+                hideLoading();
+
+                const parts = [];
+                parts.push(data.publicIp ? `Public IP: <b>${data.publicIp}</b>` : 'Public IP cleared');
+                parts.push(`server.properties updated: ${data.updated.length} server(s)`);
+                parts.push(`Restarted: ${data.restarted.length} server(s)`);
+                Swal.fire({
+                    title: 'Saved',
+                    html: `<div class="text-sm">${parts.join('<br>')}</div>`,
+                    icon: 'success',
+                    confirmButtonColor: '#10b981'
+                });
+            } catch (err) {
+                hideLoading();
+                Swal.fire({
+                    title: 'Error',
+                    text: 'Failed to save Public IP: ' + err.message,
                     icon: 'error',
                     confirmButtonColor: '#10b981'
                 });
@@ -3284,6 +3533,7 @@
 
         function showImportModal() {
             document.getElementById('importContainerName').value = '';
+            document.getElementById('importMigrate').checked = true;
             openModal('importModal');
         }
 
@@ -3304,7 +3554,7 @@
                 const response = await fetch(`${API_BASE}/servers/import`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ containerName })
+                    body: JSON.stringify({ containerName, migrate: document.getElementById('importMigrate').checked })
                 });
 
                 const result = await response.json();
@@ -3313,13 +3563,21 @@
                     closeModal('importModal');
                     await fetchServers();
                     hideLoading();
+                    const mg = result.migration || {};
+                    const udpRange = mg.udpPorts ? (mg.udpPorts[0] + '-' + mg.udpPorts[1]) : '-';
                     Swal.fire({
-                        title: 'Success',
-                        text: 'Server imported successfully!',
+                        title: (mg.inPlace ? 'Server converted' : 'Server imported'),
+                        html: '<div class="text-left text-sm">' +
+                            '<div>Original: <b>' + (mg.originalModel || '-') + '</b>' + (mg.originalPort ? ' (port ' + mg.originalPort + ')' : '') + '</div>' +
+                            '<div>Transport: <b>' + (mg.convertedToNethernet ? 'NetherNet (converted)' : 'unchanged') + '</b></div>' +
+                            (mg.inPlace ? '<div class="text-xs text-blue-300">Server created by this manager: container recreated in place (data not copied)</div>' : '') +
+                            '<div class="text-xs text-gray-400">' + (mg.reason || '') + '</div>' +
+                            '<div class="mt-2">Game port (TCP + UDP): <b>' + result.gamePort + '</b></div>' +
+                            '<div>NetherNet UDP ports: <b>' + udpRange + '</b></div>' +
+                            '<div class="text-xs text-gray-400 mt-2">Make sure TCP ' + result.gamePort + ' and UDP ' + udpRange + ' are forwarded on the VPS/proxy, and that the Public IP is set (🌐 Public IP button).</div>' +
+                            '</div>',
                         icon: 'success',
-                        confirmButtonColor: '#10b981',
-                        timer: 2000,
-                        timerProgressBar: true
+                        confirmButtonColor: '#10b981'
                     });
                 } else {
                     hideLoading();
